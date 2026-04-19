@@ -383,7 +383,9 @@ def compute_metrics(
 
 
 def mt_collater_adapter(
-    tasks: list[Task], exclude_keys: list[str] = DEFAULT_EXCLUDE_KEYS
+    tasks: list[Task],
+    exclude_keys: list[str] = DEFAULT_EXCLUDE_KEYS,
+    transforms: dict | None = None,
 ):
     # this is required because the MTCollater needs the old json formated task config so we need to convert it here
     task_config_old = {}
@@ -400,7 +402,18 @@ def mt_collater_adapter(
             "train_on_free_atoms": task.train_on_free_atoms,
             "eval_on_free_atoms": task.eval_on_free_atoms,
         }
-    return MTCollater(task_config_old, exclude_keys)
+    collater = MTCollater(task_config_old, exclude_keys)
+    if not transforms:
+        return collater
+
+    from fairchem.core.modules.transforms import DataTransforms
+
+    data_transforms = DataTransforms(transforms)
+
+    def collater_with_transforms(data_list: list[AtomicData]) -> AtomicData:
+        return data_transforms(collater(data_list))
+
+    return collater_with_transforms
 
 
 def _get_consine_lr_scheduler(

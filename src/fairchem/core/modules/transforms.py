@@ -175,6 +175,174 @@ def stress_reshape_transform(data_object: AtomicData, config) -> AtomicData:
     return data_object
 
 
+def _random_rotation_matrix(
+    num_transforms: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Sample a Haar-uniform 3D rotation matrix."""
+    u1, u2, u3 = torch.rand(num_transforms, 3, device=device, dtype=dtype).unbind(-1)
+    two_pi = 2.0 * torch.pi
+
+    qx = torch.sqrt(1.0 - u1) * torch.sin(two_pi * u2)
+    qy = torch.sqrt(1.0 - u1) * torch.cos(two_pi * u2)
+    qz = torch.sqrt(u1) * torch.sin(two_pi * u3)
+    qw = torch.sqrt(u1) * torch.cos(two_pi * u3)
+
+    return torch.stack(
+        [
+            torch.stack(
+                [
+                    1.0 - 2.0 * (qy * qy + qz * qz),
+                    2.0 * (qx * qy - qz * qw),
+                    2.0 * (qx * qz + qy * qw),
+                ],
+                dim=-1,
+            ),
+            torch.stack(
+                [
+                    2.0 * (qx * qy + qz * qw),
+                    1.0 - 2.0 * (qx * qx + qz * qz),
+                    2.0 * (qy * qz - qx * qw),
+                ],
+                dim=-1,
+            ),
+            torch.stack(
+                [
+                    2.0 * (qx * qz - qy * qw),
+                    2.0 * (qy * qz + qx * qw),
+                    1.0 - 2.0 * (qx * qx + qy * qy),
+                ],
+                dim=-1,
+            ),
+        ],
+        dim=-2,
+    )
+
+
+def _get_o3_transformation(data_object: AtomicData, config) -> torch.Tensor:
+    device = data_object.pos.device
+    dtype = data_object.pos.dtype
+    num_transforms = data_object.num_graphs
+
+    if "matrix" in config:
+        transformation = torch.as_tensor(config["matrix"], device=device, dtype=dtype)
+        if transformation.shape == (3, 3):
+            transformation = transformation.expand(num_transforms, -1, -1)
+        elif transformation.shape != (num_transforms, 3, 3):
+            raise ValueError(
+                "random_o3_transform matrix must have shape [3, 3] or "
+                f"[{num_transforms}, 3, 3]."
+            )
+        return transformation
+
+    if config.get("rotation", True):
+        transformation = _random_rotation_matrix(num_transforms, device, dtype)
+    else:
+        transformation = torch.eye(3, device=device, dtype=dtype).expand(
+            num_transforms, -1, -1
+        )
+
+    if config.get("inversion", True):
+        inversion_probability = float(config.get("inversion_probability", 0.5))
+        if not 0.0 <= inversion_probability <= 1.0:
+            raise ValueError("inversion_probability must be between 0 and 1.")
+        inversion_mask = (
+            torch.rand(num_transforms, 1, 1, device=device) < inversion_probability
+        )
+        transformation = torch.where(inversion_mask, -transformation, transformation)
+
+    return transformation
+
+
+def _rotate_rows(values: torch.Tensor, transformation: torch.Tensor) -> torch.Tensor:
+    return torch.bmm(values.unsqueeze(-2), transformation.transpose(-1, -2)).squeeze(
+        -2
+    )
+
+
+def _get_value_transformations(
+    data_object: AtomicData, values: torch.Tensor, transformation: torch.Tensor, key: str
+) -> torch.Tensor:
+    if values.shape[0] == data_object.pos.shape[0]:
+        return transformation[data_object.batch]
+    if values.shape[0] == data_object.num_graphs:
+        return transformation
+    raise ValueError(
+        f"random_o3_transform could not map '{key}' with leading dimension "
+        f"{values.shape[0]} to either atoms ({data_object.pos.shape[0]}) or "
+        f"graphs ({data_object.num_graphs})."
+    )
+
+
+def _rotate_vectors(data_object: AtomicData, keys, transformation: torch.Tensor) -> None:
+    for key in keys:
+        if key in data_object:
+            values = data_object[key]
+            if not torch.is_tensor(values) or values.shape[-1] != 3:
+                raise ValueError(
+                    f"random_o3_transform expected '{key}' to be a tensor with "
+                    f"last dimension 3, got {type(values)} with shape "
+                    f"{getattr(values, 'shape', None)}."
+                )
+            value_transformation = _get_value_transformations(
+                data_object, values, transformation, key
+            )
+            data_object[key] = _rotate_rows(values, value_transformation)
+
+
+def _rotate_rank2_tensors(
+    data_object: AtomicData, keys, transformation: torch.Tensor
+) -> None:
+    for key in keys:
+        if key not in data_object:
+            continue
+
+        values = data_object[key]
+        if not torch.is_tensor(values):
+            raise ValueError(f"random_o3_transform expected '{key}' to be a tensor.")
+
+        original_shape = values.shape
+        if values.shape[-2:] == (3, 3):
+            matrices = values
+        elif values.shape[-1:] == (9,):
+            matrices = values.reshape(values.shape[:-1] + (3, 3))
+        else:
+            raise ValueError(
+                f"random_o3_transform expected '{key}' to have shape [..., 3, 3] "
+                f"or [..., 9], got {values.shape}."
+            )
+
+        value_transformation = _get_value_transformations(
+            data_object, matrices, transformation, key
+        )
+        rotated = torch.bmm(
+            torch.bmm(value_transformation, matrices),
+            value_transformation.transpose(-1, -2),
+        )
+        data_object[key] = rotated.reshape(original_shape)
+
+
+def random_o3_transform(data_object: AtomicData, config) -> AtomicData:
+    """Apply random rotation and optional inversion augmentation.
+
+    This mirrors the Cartesian part of metatrain's RotationalAugmenter. Configure
+    it only on training datasets. It updates geometry fields and matching
+    Cartesian targets, while leaving scalar targets and graph connectivity
+    unchanged.
+    """
+    transformation = _get_o3_transformation(data_object, config)
+
+    data_object.pos = _rotate_rows(data_object.pos, transformation[data_object.batch])
+    if "cell" in data_object:
+        data_object.cell = torch.bmm(data_object.cell, transformation.transpose(-1, -2))
+
+    vector_keys = config.get("vector_keys", ["forces"])
+    rank2_keys = config.get("rank2_keys", ["stress"])
+    _rotate_vectors(data_object, vector_keys, transformation)
+    _rotate_rank2_tensors(data_object, rank2_keys, transformation)
+
+    return data_object
+
+
 def asedb_transform(data_object: AtomicData, config) -> AtomicData:
     data_object.dataset = config["dataset_name"]
     data_object.sid = str(

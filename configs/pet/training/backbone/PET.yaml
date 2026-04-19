@@ -1,0 +1,9 @@
+model: fairchem.core.models.pet.PET.PETBackbone
+
+regress_forces: true
+direct_forces: true
+regress_stress: true
+direct_stress: true
+max_num_elements: 100
+max_neighbors: ${max_neighbors}
+cutoff: ${cutoff_radius}

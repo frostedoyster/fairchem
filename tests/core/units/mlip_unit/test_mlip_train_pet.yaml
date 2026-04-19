@@ -1,0 +1,67 @@
+defaults:
+  - datasets: aselmdb
+  - tasks: oc20_omol
+  - optimizer: adamw
+  - _self_
+
+job:
+  device_type: CPU
+  scheduler:
+    mode: LOCAL
+    distributed_init_method: FILE
+  debug: True
+
+max_neighbors: 20
+cutoff_radius: 6
+max_steps: 2
+max_epochs: null
+expected_loss: null
+checkpoint_every: null
+
+backbone:
+  model: fairchem.core.models.pet.PET.PETBackbone
+  regress_forces: True
+  direct_forces: True
+  regress_stress: False
+  max_neighbors: ${max_neighbors}
+  cutoff: ${cutoff_radius}
+
+runner:
+  _target_: fairchem.core.components.train.train_runner.TrainEvalRunner
+  train_dataloader: ${datasets.train_dataloader}
+  eval_dataloader: ${datasets.val_dataloader}
+  train_eval_unit:
+    _target_: fairchem.core.units.mlip_unit.mlip_unit.MLIPTrainEvalUnit
+    job_config: ${job}
+    tasks: ${tasks}
+    model:
+      _target_: fairchem.core.models.base.HydraModel
+      backbone: ${backbone}
+      heads:
+        oc20_energy:
+          module: fairchem.core.models.pet.PET.PETEnergyHead
+        omol_energy:
+          module: fairchem.core.models.pet.PET.PETEnergyHead
+        forces:
+          module: fairchem.core.models.pet.PET.PETDirectForceHead
+    optimizer_fn: ${optimizer}
+    cosine_lr_scheduler_fn:
+      _target_: fairchem.core.units.mlip_unit.mlip_unit._get_consine_lr_scheduler
+      _partial_: true
+      warmup_factor: 0.2
+      warmup_epochs: 1
+      lr_min_factor: 0.01
+      epochs: 1
+    print_every: 1
+    clip_grad_norm: 100
+    bf16: False
+  max_epochs: ${max_epochs}
+  max_steps: ${max_steps}
+  callbacks:
+      - _target_: fairchem.core.components.train.train_runner.TrainCheckpointCallback
+        checkpoint_every_n_steps: ${checkpoint_every}
+        max_saved_checkpoints: 10
+      - _target_: tests.core.units.mlip_unit.test_mlip_unit.TrainEndCallback
+        expected_loss: ${expected_loss}
+        expected_max_steps: ${max_steps}
+        expected_max_epochs: ${max_epochs}
