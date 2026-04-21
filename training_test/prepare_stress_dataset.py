@@ -17,10 +17,10 @@ def main() -> None:
         )
     )
     parser.add_argument(
-        "--xyz",
+        "xyz",
         type=Path,
-        default=Path(__file__).resolve().parent / "mad-test.xyz",
         help="Input extended XYZ file.",
+        required=True,
     )
     parser.add_argument(
         "--out-dir",

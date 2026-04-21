@@ -31,6 +31,19 @@ AVAILABLE_TRANSFORMER_TYPES = ["PostLN", "PreLN"]
 AVAILABLE_ACTIVATIONS = ["SiLU", "SwiGLU"]
 
 
+class Linear(torch.nn.Module):
+
+    def __init__(self, n_feat_in, n_feat_out, scale_factor=1.0):
+        super().__init__()
+        self.linear_layer = torch.nn.Linear(n_feat_in, n_feat_out)
+        self.n_feat_in = n_feat_in if n_feat_in > 0 else 1
+        self.linear_layer.weight.data.normal_(0.0, (scale_factor * self.n_feat_in) ** (-0.5))
+        self.linear_layer.bias.data.zero_()
+
+    def forward(self, x):
+        return self.linear_layer(x)
+
+
 class DummyModule(torch.nn.Module):
     """Dummy torch module to make torchscript happy.
     This model should never be run"""
@@ -50,14 +63,14 @@ class FeedForward(nn.Module):
         # Check if activation is "swiglu" string
         if activation.lower() == "swiglu":
             # SwiGLU mode: single projection produces both "value" and "gate"
-            self.w_in = nn.Linear(d_model, 2 * dim_feedforward)
-            self.w_out = nn.Linear(dim_feedforward, d_model)
+            self.w_in = Linear(d_model, 2 * dim_feedforward)
+            self.w_out = Linear(dim_feedforward, d_model)
             self.activation = torch.nn.Identity()
             self.is_swiglu = True
         else:
             # Standard mode: regular activation function
-            self.w_in = nn.Linear(d_model, dim_feedforward)
-            self.w_out = nn.Linear(dim_feedforward, d_model)
+            self.w_in = Linear(d_model, dim_feedforward)
+            self.w_out = Linear(dim_feedforward, d_model)
             self.activation = getattr(F, activation.lower())
             self.is_swiglu = False
 
@@ -96,8 +109,8 @@ class AttentionBlock(nn.Module):
     ) -> None:
         super(AttentionBlock, self).__init__()
 
-        self.input_linear = nn.Linear(total_dim, 3 * total_dim)
-        self.output_linear = nn.Linear(total_dim, total_dim)
+        self.input_linear = Linear(total_dim, 3 * total_dim)
+        self.output_linear = Linear(total_dim, total_dim)
 
         self.num_heads = num_heads
         self.epsilon = epsilon
@@ -182,8 +195,8 @@ class TransformerLayer(torch.nn.Module):
         self.expanded_node_features = False
         if dim_node_features != d_model:
             self.expanded_node_features = True
-            self.center_contraction = nn.Linear(dim_node_features, d_model)
-            self.center_expansion = nn.Linear(d_model, dim_node_features)
+            self.center_contraction = Linear(dim_node_features, d_model)
+            self.center_expansion = Linear(d_model, dim_node_features)
             self.norm_center_features = norm_class(dim_node_features)
             self.center_mlp = FeedForward(
                 dim_node_features, 2 * dim_node_features, activation
@@ -201,10 +214,15 @@ class TransformerLayer(torch.nn.Module):
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print("before contraction", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
+
         if self.expanded_node_features:
             input_node_embeddings = self.center_contraction(node_embeddings)
         else:
             input_node_embeddings = node_embeddings
+
+        # print("before expanded", input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
+
         tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
         new_tokens = self.attention(
             self.norm_attention(tokens), cutoff_factors, use_manual_attention
@@ -213,6 +231,7 @@ class TransformerLayer(torch.nn.Module):
             new_tokens, [1, new_tokens.shape[1] - 1], dim=1
         )
         if self.expanded_node_features:
+            # print("expanded node features", flush=True)
             output_node_embeddings = node_embeddings + self.center_expansion(
                 output_node_embeddings
             )
@@ -224,6 +243,8 @@ class TransformerLayer(torch.nn.Module):
         output_edge_embeddings = output_edge_embeddings + self.mlp(
             self.norm_mlp(output_edge_embeddings)
         )
+
+        # print("after expanded", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
 
         return output_node_embeddings, output_edge_embeddings
 
@@ -437,22 +458,22 @@ class CartesianTransformer(torch.nn.Module):
             attention_temperature=attention_temperature,
         )
 
-        self.edge_embedder = nn.Linear(4, d_model)
+        # self.edge_embedder = Linear(4, d_model)
 
-        if not is_first:
-            n_merge = 3
-        else:
-            n_merge = 2
+        # if not is_first:
+        #     n_merge = 3
+        # else:
+        #     n_merge = 2
 
-        self.compress = nn.Sequential(
-            nn.Linear(n_merge * d_model, d_model),
-            torch.nn.SiLU(),
-            nn.Linear(d_model, d_model),
-        )
+        # self.compress = nn.Sequential(
+        #     Linear(n_merge * d_model, d_model),
+        #     torch.nn.SiLU(),
+        #     Linear(d_model, d_model),
+        # )
 
-        self.neighbor_embedder = DummyModule()  # for torchscript
-        if not is_first:
-            self.neighbor_embedder = nn.Embedding(n_atomic_species, d_model)
+        # self.neighbor_embedder = DummyModule()  # for torchscript
+        # if not is_first:
+        #     self.neighbor_embedder = nn.Embedding(n_atomic_species, d_model)
 
     def forward(
         self,
@@ -491,28 +512,28 @@ class CartesianTransformer(torch.nn.Module):
             - The output edge embeddings, of shape (n_nodes, max_num_neighbors, d_model)
         """
         node_embeddings = input_node_embeddings
-        edge_embeddings = [edge_vectors, edge_distances[:, :, None]]
+        # edge_embeddings = [edge_vectors, edge_distances[:, :, None]]
 
         # on some systems, on isolated atoms, a torchscript bug concatenates the two
         # (empty) float tensors into an int tensors, causing an error later on
-        edge_embeddings = torch.cat(edge_embeddings, dim=2).to(edge_vectors.dtype)
+        # edge_embeddings = torch.cat(edge_embeddings, dim=2).to(edge_vectors.dtype)
 
-        edge_embeddings = self.edge_embedder(edge_embeddings)
+        # edge_embeddings = self.edge_embedder(edge_embeddings)
 
-        if not self.is_first:
-            neighbor_elements_embeddings = self.neighbor_embedder(
-                element_indices_neighbors
-            )
-            edge_tokens = torch.cat(
-                [edge_embeddings, neighbor_elements_embeddings, input_messages], dim=2
-            )
-        else:
-            neighbor_elements_embeddings = torch.empty(
-                0, device=edge_vectors.device, dtype=edge_vectors.dtype
-            )  # for torch script
-            edge_tokens = torch.cat([edge_embeddings, input_messages], dim=2)
+        # if not self.is_first:
+        #     neighbor_elements_embeddings = self.neighbor_embedder(
+        #         element_indices_neighbors
+        #     )
+        #     edge_tokens = torch.cat(
+        #         [edge_embeddings, neighbor_elements_embeddings, input_messages], dim=2
+        #     )
+        # else:
+        #     neighbor_elements_embeddings = torch.empty(
+        #         0, device=edge_vectors.device, dtype=edge_vectors.dtype
+        #     )  # for torch script
+        #     edge_tokens = torch.cat([edge_embeddings, input_messages], dim=2)
 
-        edge_tokens = self.compress(edge_tokens)
+        edge_tokens = input_messages
         # tokens = torch.cat([node_elements_embedding[:, None, :], tokens], dim=1)
 
         padding_mask_with_central_token = torch.ones(
@@ -534,24 +555,18 @@ class CartesianTransformer(torch.nn.Module):
         cutoff_factors = cutoff_factors.repeat(1, cutoff_factors.shape[2], 1)
 
         initial_num_tokens = edge_vectors.shape[1]
-        max_num_tokens = input_messages.shape[1]
+
+        print("before attention", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
 
         output_node_embeddings, output_edge_embeddings = self.trans(
             node_embeddings[:, None, :],
-            edge_tokens[:, :max_num_tokens, :],
-            cutoff_factors=cutoff_factors[
-                :, : (max_num_tokens + 1), : (max_num_tokens + 1)
-            ],
+            edge_tokens,
+            cutoff_factors=cutoff_factors,
             use_manual_attention=use_manual_attention,
         )
-        if max_num_tokens < initial_num_tokens:
-            padding = torch.zeros(
-                output_edge_embeddings.shape[0],
-                initial_num_tokens - max_num_tokens,
-                output_edge_embeddings.shape[2],
-                device=output_edge_embeddings.device,
-            )
-            output_edge_embeddings = torch.cat([output_edge_embeddings, padding], dim=1)
+
+        print("after attention", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
+
         output_node_embeddings = output_node_embeddings.squeeze(1)
         return output_node_embeddings, output_edge_embeddings
 
@@ -899,16 +914,26 @@ class PETBackbone(nn.Module, BackboneInterface):
         self.attention_temperature = 1.0
 
         self.node_embedder = nn.Embedding(self.max_num_elements, self.d_pet * self.node_to_edge_ratio)
-        self.edge_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
+        self.edge_center_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
+        self.edge_neighbor_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
+        self.edge_directional_embedder = Linear(4, self.d_pet)
+        self.edge_compressor = torch.nn.Sequential(
+            Linear(3 * self.d_pet, 4 * self.d_pet),
+            torch.nn.SiLU(),
+            Linear(4 * self.d_pet, 4 * self.d_pet),
+            torch.nn.SiLU(),
+            Linear(4 * self.d_pet, self.d_pet),
+        )
+
         self.combination_norms = torch.nn.ModuleList(
             [torch.nn.LayerNorm(self.feedforward_ratio * self.d_pet) for _ in range(self.num_gnn_layers)]
         )
         self.combination_mlps = torch.nn.ModuleList(
             [
                 torch.nn.Sequential(
-                    torch.nn.Linear(self.feedforward_ratio * self.d_pet, self.feedforward_ratio * self.d_pet),
+                    Linear(self.feedforward_ratio * self.d_pet, self.feedforward_ratio * self.d_pet),
                     torch.nn.SiLU(),
-                    torch.nn.Linear(self.feedforward_ratio * self.d_pet, self.d_pet),
+                    Linear(self.feedforward_ratio * self.d_pet, self.d_pet),
                 )
                 for _ in range(self.num_gnn_layers)
             ]
@@ -933,7 +958,8 @@ class PETBackbone(nn.Module, BackboneInterface):
                 for layer_index in range(self.num_gnn_layers)
             ]
         )
-        self.edge_expander = torch.nn.Linear(self.d_pet, self.d_pet * self.node_to_edge_ratio)
+        self.edge_expander = Linear(self.d_pet, self.d_pet * self.node_to_edge_ratio)
+        self.edge_expander.linear_layer.weight.data.zero_()
 
 
     @classmethod
@@ -968,7 +994,7 @@ class PETBackbone(nn.Module, BackboneInterface):
         cell = data["cell"]
         pbc = data["pbc"]
         edge_index = data["edge_index"]
-        centers, neighbors = torch.unbind(edge_index, dim=0)
+        neighbors, centers = torch.unbind(edge_index, dim=0)
         cell_offsets = data["cell_offsets"]
         batch = data["batch"]
 
@@ -1014,9 +1040,8 @@ class PETBackbone(nn.Module, BackboneInterface):
         edge_distances = edge_array_to_nef(edge_distances, nef_indices)
 
         # TODO: turn into something more sane once you just do it at the beginning
-        element_indices_neighbors = edge_array_to_nef(
-            atomic_numbers_neighbors, nef_indices
-        )
+        element_indices_centers = edge_array_to_nef(atomic_numbers_centers, nef_indices)
+        element_indices_neighbors = edge_array_to_nef(atomic_numbers_neighbors, nef_indices)
         cutoff_factors = edge_array_to_nef(cutoff_factors, nef_indices, nef_mask, 0.0)
 
         corresponding_edges = get_corresponding_edges(
@@ -1050,14 +1075,25 @@ class PETBackbone(nn.Module, BackboneInterface):
 
         use_manual_attention = edge_vectors.requires_grad and self.training
 
-        input_node_embeddings = self.node_embedder(atomic_numbers)
-        input_edge_embeddings = self.edge_embedder(element_indices_neighbors)
+        node_features = self.node_embedder(atomic_numbers)
+
+        cat = torch.cat([edge_vectors, edge_distances.unsqueeze(-1)], dim=-1) / (0.5 *self.cutoff)  # very rough normalization attempt
+        edge_features = torch.concatenate([
+            self.edge_center_embedder(element_indices_centers),
+            self.edge_neighbor_embedder(element_indices_neighbors),
+            self.edge_directional_embedder(cat)
+        ], dim=-1)
+        edge_features = self.edge_compressor(edge_features)
+        
+        # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
+        print("before", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
+
         for combination_norm, combination_mlp, gnn_layer in zip(
             self.combination_norms, self.combination_mlps, self.gnn_layers, strict=True
         ):
-            output_node_embeddings, output_edge_embeddings = gnn_layer(
-                input_node_embeddings,
-                input_edge_embeddings,
+            node_features, edge_features = gnn_layer(
+                node_features,
+                edge_features,
                 element_indices_neighbors,
                 edge_vectors,
                 nef_mask,
@@ -1066,31 +1102,31 @@ class PETBackbone(nn.Module, BackboneInterface):
                 use_manual_attention,
             )
 
+            print("after gnn", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
+
             # The GNN contraction happens by reordering the messages,
             # using a reversed neighbor list, so the new input message
             # from atom `j` to atom `i` in on the GNN layer N+1 is a
             # reversed message from atom `i` to atom `j` on the GNN layer N.
-            input_node_embeddings = output_node_embeddings
-            new_input_edge_embeddings = output_edge_embeddings.reshape(
-                output_edge_embeddings.shape[0] * output_edge_embeddings.shape[1],
-                output_edge_embeddings.shape[2],
+            corresponding_edge_features = edge_features.reshape(
+                edge_features.shape[0] * edge_features.shape[1],
+                edge_features.shape[2],
             )[reverse_neighbor_index].reshape(
-                output_edge_embeddings.shape[0],
-                output_edge_embeddings.shape[1],
-                output_edge_embeddings.shape[2],
+                edge_features.shape[0],
+                edge_features.shape[1],
+                edge_features.shape[2],
             )
             concatenated = torch.cat(
-                [output_edge_embeddings, new_input_edge_embeddings], dim=-1
+                [edge_features, corresponding_edge_features], dim=-1
             )
-            input_edge_embeddings = (
-                input_edge_embeddings
-                + output_edge_embeddings
-                + combination_mlp(combination_norm(concatenated))
-            )
+            edge_features = edge_features + combination_mlp(combination_norm(concatenated))
 
-        node_features = input_node_embeddings
-        edge_features = input_edge_embeddings * cutoff_factors.unsqueeze(-1)
+            # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
+            print("after combination", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
+        
+        print(flush=True)
 
+        edge_features = edge_features * cutoff_factors.unsqueeze(-1)
         node_features = node_features + self.edge_expander(torch.sum(edge_features, dim=1))
 
         # TODO: this is messed up, you could do this for the energy
@@ -1113,9 +1149,9 @@ class PETEnergyHead(nn.Module, HeadInterface):
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+            Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
             nn.SiLU(),
-            nn.Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 1),
+            Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 1),
         )
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
@@ -1135,9 +1171,9 @@ class PETDirectForceHead(nn.Module, HeadInterface):
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+            Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
             nn.SiLU(),
-            nn.Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
+            Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
         )
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
@@ -1152,9 +1188,9 @@ class PETDirectStressHead(nn.Module, HeadInterface):
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+            Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
             nn.SiLU(),
-            nn.Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 9),
+            Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 9),
         )
 
     def forward(
