@@ -69,13 +69,13 @@ tasks:
 
 mad_train_dataset: &mad_dataset
   format: ase_db
-  splits: {train: {src: "${oc.env:PWD}/mad-test_mixed_db/data.db", sample_n: 5000, seed: 0}}
+  splits: {train: {src: "${oc.env:PWD}/mad-test_mixed_db/data.db", no_shuffle: True}}
   a2g_args: {r_energy: True, r_forces: True, r_stress: True, r_edges: True, radius: 5.0, max_neigh: 20, external_graph_method: nvidia}
   keep_in_memory: True
   transforms: {common_transform: {dataset_name: mad}, stress_reshape_transform: {}}
 mad_val_dataset:
   <<: *mad_dataset
-  splits: {val: {src: "${oc.env:PWD}/mad-test_mixed_db/data.db", sample_n: 500, seed: 1}}
+  splits: {val: {src: "${oc.env:PWD}/mad-test_mixed_db/data.db", no_shuffle: True}}
 
 train_dataset:
   _target_: fairchem.core.datasets.mt_concat_dataset.create_concat_dataset

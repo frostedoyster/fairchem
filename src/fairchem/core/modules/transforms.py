@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import math
 import numpy as np
 import torch
 from ase import Atoms
@@ -339,6 +340,140 @@ def random_o3_transform(data_object: AtomicData, config) -> AtomicData:
     rank2_keys = config.get("rank2_keys", ["stress"])
     _rotate_vectors(data_object, vector_keys, transformation)
     _rotate_rank2_tensors(data_object, rank2_keys, transformation)
+
+    return data_object
+
+
+def dens_transform(data_object: AtomicData, config) -> AtomicData:
+    """Apply DeNS-style position noise and rewrite force targets on noisy atoms.
+
+    This is intended as a collate-time transform so noise is resampled every epoch.
+    Graphs selected for DeNS get:
+    - noisy positions on a subset of atoms
+    - original forces copied to ``force_data`` for model-side force encoding
+    - atomwise ``forces`` targets replaced by the denoising vector on noisy atoms
+    - optional masking of graph-level targets such as energy/stress via ``inf``
+    """
+
+    if "batch" in data_object:
+        batch = data_object.batch.long()
+    else:
+        batch = torch.zeros(
+            data_object.pos.shape[0], device=data_object.pos.device, dtype=torch.long
+        )
+    num_graphs = data_object.num_graphs if "natoms" in data_object else 1
+    num_atoms = int(data_object.pos.shape[0])
+    device = data_object.pos.device
+    dtype = data_object.pos.dtype
+
+    graph_probability = float(config.get("graph_probability", 1.0))
+    atom_probability = float(config.get("atom_probability", 1.0))
+    noise_std = float(config.get("noise_std", 0.01))
+    respect_fixed = bool(config.get("respect_fixed", True))
+    mask_energy = bool(config.get("mask_energy", True))
+    mask_stress = bool(config.get("mask_stress", True))
+    max_force_norm = config.get("max_force_norm")
+    max_corrupted_fraction = float(config.get("max_corrupted_fraction", 1.0))
+
+    if not 0.0 <= graph_probability <= 1.0:
+        raise ValueError("dens_transform graph_probability must be between 0 and 1.")
+    if not 0.0 <= atom_probability <= 1.0:
+        raise ValueError("dens_transform atom_probability must be between 0 and 1.")
+    if noise_std < 0.0:
+        raise ValueError("dens_transform noise_std must be non-negative.")
+    if max_force_norm is not None and float(max_force_norm) < 0.0:
+        raise ValueError("dens_transform max_force_norm must be non-negative.")
+    if not 0.0 <= max_corrupted_fraction <= 1.0:
+        raise ValueError(
+            "dens_transform max_corrupted_fraction must be between 0 and 1."
+        )
+
+    dens_batch_mask = torch.rand(num_graphs, device=device) < graph_probability
+    if max_force_norm is not None and "forces" in data_object:
+        force_norms = torch.linalg.vector_norm(data_object.forces, dim=-1)
+        per_graph_force_max = torch.full(
+            (num_graphs,),
+            0.0,
+            device=device,
+            dtype=force_norms.dtype,
+        )
+        per_graph_force_max.scatter_reduce_(
+            0,
+            batch,
+            force_norms,
+            reduce="amax",
+            include_self=True,
+        )
+        dens_batch_mask = dens_batch_mask & (per_graph_force_max <= float(max_force_norm))
+
+    eligible_atoms = dens_batch_mask[batch]
+    if respect_fixed and "fixed" in data_object:
+        eligible_atoms = eligible_atoms & (data_object.fixed == 0)
+
+    noise_mask = eligible_atoms
+    if atom_probability < 1.0:
+        noise_mask = noise_mask & (torch.rand(num_atoms, device=device) < atom_probability)
+
+    if max_corrupted_fraction < 1.0:
+        for graph_idx in torch.nonzero(dens_batch_mask, as_tuple=False).flatten():
+            graph_eligible = torch.nonzero(
+                eligible_atoms & (batch == graph_idx), as_tuple=False
+            ).flatten()
+            if graph_eligible.numel() == 0:
+                continue
+            max_corrupted_atoms = max(
+                1,
+                math.floor(graph_eligible.numel() * max_corrupted_fraction),
+            )
+            graph_noisy = torch.nonzero(
+                noise_mask & (batch == graph_idx), as_tuple=False
+            ).flatten()
+            if graph_noisy.numel() > max_corrupted_atoms:
+                keep_order = torch.randperm(graph_noisy.numel(), device=device)[
+                    :max_corrupted_atoms
+                ]
+                keep_mask = torch.zeros(
+                    graph_noisy.numel(), device=device, dtype=torch.bool
+                )
+                keep_mask[keep_order] = True
+                noise_mask[graph_noisy[~keep_mask]] = False
+
+    if dens_batch_mask.any():
+        for graph_idx in torch.nonzero(dens_batch_mask, as_tuple=False).flatten():
+            graph_eligible = eligible_atoms & (batch == graph_idx)
+            if graph_eligible.any() and not (noise_mask & (batch == graph_idx)).any():
+                noise_mask[torch.nonzero(graph_eligible, as_tuple=False)[0, 0]] = True
+
+    dens_batch_mask = torch.bincount(batch[noise_mask], minlength=num_graphs) > 0
+    data_object.noise_mask = noise_mask
+    data_object.dens_batch_mask = dens_batch_mask
+    data_object.denoising_pos_forward = dens_batch_mask
+
+    if "forces" in data_object:
+        force_data = data_object.forces.clone()
+    else:
+        force_data = torch.zeros((num_atoms, 3), device=device, dtype=dtype)
+    data_object.force_data = force_data
+
+    noise = torch.randn_like(data_object.pos) * noise_std
+    noise = noise * noise_mask.unsqueeze(-1).to(dtype)
+    data_object.pos = data_object.pos + noise
+
+    if "forces" in data_object:
+        denoising_target = -noise
+        data_object.forces = torch.where(
+            noise_mask.unsqueeze(-1),
+            denoising_target,
+            data_object.forces,
+        )
+
+    if mask_energy and "energy" in data_object:
+        data_object.energy = data_object.energy.clone()
+        data_object.energy[dens_batch_mask] = torch.inf
+
+    if mask_stress and "stress" in data_object:
+        data_object.stress = data_object.stress.clone()
+        data_object.stress[dens_batch_mask] = torch.inf
 
     return data_object
 

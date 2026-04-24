@@ -145,7 +145,9 @@ class AttentionBlock(nn.Module):
         attn_weights = torch.clamp(cutoff_factors[:, None, :, :], self.epsilon)
         attn_weights = torch.log(attn_weights)
         if use_manual_attention:
-            x = manual_attention(queries, keys, values, attn_weights, self.temperature)
+            x = manual_attention(
+                queries, keys, values, attn_weights, self.temperature
+            )
         else:
             x = torch.nn.functional.scaled_dot_product_attention(
                 queries,
@@ -302,11 +304,17 @@ class TransformerLayer(torch.nn.Module):
         """
         if self.transformer_type == "PostLN":
             node_embeddings, edge_embeddings = self._forward_post_ln_impl(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+                node_embeddings,
+                edge_embeddings,
+                cutoff_factors,
+                use_manual_attention,
             )
         if self.transformer_type == "PreLN":
             node_embeddings, edge_embeddings = self._forward_pre_ln_impl(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+                node_embeddings,
+                edge_embeddings,
+                cutoff_factors,
+                use_manual_attention,
             )
         return node_embeddings, edge_embeddings
 
@@ -556,7 +564,7 @@ class CartesianTransformer(torch.nn.Module):
 
         initial_num_tokens = edge_vectors.shape[1]
 
-        print("before attention", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
+        # print("before attention", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
 
         output_node_embeddings, output_edge_embeddings = self.trans(
             node_embeddings[:, None, :],
@@ -565,7 +573,7 @@ class CartesianTransformer(torch.nn.Module):
             use_manual_attention=use_manual_attention,
         )
 
-        print("after attention", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
+        # print("after attention", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
 
         output_node_embeddings = output_node_embeddings.squeeze(1)
         return output_node_embeddings, output_edge_embeddings
@@ -889,6 +897,7 @@ class PETBackbone(nn.Module, BackboneInterface):
         direct_forces: bool = True,
         regress_stress: bool = True,
         direct_stress: bool = True,
+        dens_enabled: bool = False,
         max_num_elements: int = 1000,
         cutoff: float = 5.0,
         **kwargs,
@@ -898,6 +907,7 @@ class PETBackbone(nn.Module, BackboneInterface):
         self.direct_forces = direct_forces
         self.regress_stress = regress_stress
         self.direct_stress = direct_stress
+        self.dens_enabled = dens_enabled
         self.max_num_elements = max_num_elements
         self.cutoff = cutoff
         self.extra_config = kwargs
@@ -914,15 +924,24 @@ class PETBackbone(nn.Module, BackboneInterface):
         self.attention_temperature = 1.0
 
         self.node_embedder = nn.Embedding(self.max_num_elements, self.d_pet * self.node_to_edge_ratio)
+        if self.dens_enabled:
+            self.dens_force_encoder = torch.nn.Sequential(
+                Linear(4, self.node_to_edge_ratio * self.d_pet),
+                torch.nn.SiLU(),
+                Linear(self.node_to_edge_ratio * self.d_pet, self.node_to_edge_ratio * self.d_pet),
+            )
         self.edge_center_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
         self.edge_neighbor_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
         self.edge_directional_embedder = Linear(4, self.d_pet)
         self.edge_compressor = torch.nn.Sequential(
-            Linear(3 * self.d_pet, 4 * self.d_pet),
+            Linear(3 * self.d_pet, self.d_pet),
             torch.nn.SiLU(),
-            Linear(4 * self.d_pet, 4 * self.d_pet),
+            Linear(self.d_pet, self.d_pet),
             torch.nn.SiLU(),
-            Linear(4 * self.d_pet, self.d_pet),
+            Linear(self.d_pet, self.d_pet),
+            torch.nn.SiLU(),
+            Linear(self.d_pet, self.d_pet),
+
         )
 
         self.combination_norms = torch.nn.ModuleList(
@@ -985,10 +1004,7 @@ class PETBackbone(nn.Module, BackboneInterface):
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         pass
 
-    def forward(self, data: AtomicData) -> dict[str, torch.Tensor]:
-        if self.regress_forces and not self.direct_forces:
-            data["pos"].requires_grad_(True)
-
+    def _forward_impl(self, data: AtomicData) -> dict[str, torch.Tensor]:
         positions = data["pos"]
         atomic_numbers = data["atomic_numbers"]
         cell = data["cell"]
@@ -997,6 +1013,29 @@ class PETBackbone(nn.Module, BackboneInterface):
         neighbors, centers = torch.unbind(edge_index, dim=0)
         cell_offsets = data["cell_offsets"]
         batch = data["batch"]
+
+        displacement = None
+        if self.regress_stress and not self.direct_stress:
+            displacement = torch.zeros(
+                (len(cell), 3, 3),
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            displacement.requires_grad_(True)
+            symmetric_displacement = 0.5 * (
+                displacement + displacement.transpose(-1, -2)
+            )
+            positions = positions + torch.bmm(
+                positions.unsqueeze(-2),
+                torch.index_select(symmetric_displacement, 0, batch),
+            ).squeeze(-2)
+            cell = cell + torch.bmm(cell, symmetric_displacement)
+
+        if self.regress_forces and not self.direct_forces:
+            positions.requires_grad_(True)
+
+        data["pos"] = positions
+        data["cell"] = cell
 
         data["atomic_numbers_full"] = atomic_numbers
         data["batch_full"] = batch
@@ -1076,6 +1115,22 @@ class PETBackbone(nn.Module, BackboneInterface):
         use_manual_attention = edge_vectors.requires_grad and self.training
 
         node_features = self.node_embedder(atomic_numbers)
+        if self.dens_enabled and "force_data" in data:
+            noise_mask = (
+                data["noise_mask"]
+                if "noise_mask" in data
+                else torch.zeros_like(atomic_numbers, dtype=torch.bool)
+            )
+            force_data = data["force_data"].to(node_features.dtype)
+            force_norm = torch.linalg.vector_norm(
+                force_data, dim=-1, keepdim=True
+            )
+            force_embedding = self.dens_force_encoder(
+                torch.cat([force_data, force_norm], dim=-1)
+            )
+            node_features = node_features + force_embedding * noise_mask.unsqueeze(-1).to(
+                node_features.dtype
+            )
 
         cat = torch.cat([edge_vectors, edge_distances.unsqueeze(-1)], dim=-1) / (0.5 *self.cutoff)  # very rough normalization attempt
         edge_features = torch.concatenate([
@@ -1084,9 +1139,10 @@ class PETBackbone(nn.Module, BackboneInterface):
             self.edge_directional_embedder(cat)
         ], dim=-1)
         edge_features = self.edge_compressor(edge_features)
+        # edge_features = edge_features + self.edge_mlp(edge_features)
         
         # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
-        print("before", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
+        # print("before", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
 
         for combination_norm, combination_mlp, gnn_layer in zip(
             self.combination_norms, self.combination_mlps, self.gnn_layers, strict=True
@@ -1102,7 +1158,7 @@ class PETBackbone(nn.Module, BackboneInterface):
                 use_manual_attention,
             )
 
-            print("after gnn", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
+            # print("after gnn", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
 
             # The GNN contraction happens by reordering the messages,
             # using a reversed neighbor list, so the new input message
@@ -1122,9 +1178,9 @@ class PETBackbone(nn.Module, BackboneInterface):
             edge_features = edge_features + combination_mlp(combination_norm(concatenated))
 
             # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
-            print("after combination", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
+            # print("after combination", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
         
-        print(flush=True)
+        # print(flush=True)
 
         edge_features = edge_features * cutoff_factors.unsqueeze(-1)
         node_features = node_features + self.edge_expander(torch.sum(edge_features, dim=1))
@@ -1140,7 +1196,18 @@ class PETBackbone(nn.Module, BackboneInterface):
         atoms_bincount = torch.bincount(data["batch"], minlength=len(data["cell"]))
         structure_features = structure_features / atoms_bincount.unsqueeze(-1).clamp(min=1)
 
-        return {"node_features": node_features, "structure_features": structure_features}
+        outputs = {"node_features": node_features, "structure_features": structure_features}
+        if displacement is not None:
+            outputs["displacement"] = displacement
+        return outputs
+
+    def forward(self, data: AtomicData) -> dict[str, torch.Tensor]:
+        if (self.regress_forces and not self.direct_forces) or (
+            self.regress_stress and not self.direct_stress
+        ):
+            with torch.enable_grad():
+                return self._forward_impl(data)
+        return self._forward_impl(data)
 
 
 @registry.register_model("PET_energy_head")
@@ -1170,15 +1237,34 @@ class PETDirectForceHead(nn.Module, HeadInterface):
     # multi-layer perceptron on the node features
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
+        self.dens_enabled = backbone.dens_enabled
         self.mlp = nn.Sequential(
             Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
             nn.SiLU(),
             Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
         )
+        if self.dens_enabled:
+            self.dens_mlp = nn.Sequential(
+                Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+                nn.SiLU(),
+                Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
+            )
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         forces = self.mlp(emb["node_features"])
+        if self.dens_enabled:
+            noise_mask = (
+                data["noise_mask"]
+                if "noise_mask" in data
+                else torch.zeros(
+                    emb["node_features"].shape[0],
+                    device=emb["node_features"].device,
+                    dtype=torch.bool,
+                )
+            ).view(-1, 1)
+            dens_forces = self.dens_mlp(emb["node_features"])
+            forces = torch.where(noise_mask, dens_forces, forces)
         return {"forces": forces}
     
 
@@ -1197,32 +1283,107 @@ class PETDirectStressHead(nn.Module, HeadInterface):
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         stress = self.mlp(emb["structure_features"])
+        if "dens_batch_mask" in data:
+            stress = torch.where(
+                data["dens_batch_mask"].view(-1, 1),
+                torch.zeros_like(stress),
+                stress,
+            )
         return {"stress": stress}
 
 
 @registry.register_model("PET_grad_energy_force_stress_head")
 class PETGradientEnergyForceStressHead(PETEnergyHead):
-    """Dummy PET head that can emit energy, autograd forces, and zero stress."""
+    def __init__(self, backbone: PETBackbone) -> None:
+        super().__init__(backbone)
+        self.regress_forces = backbone.regress_forces
+        self.direct_forces = backbone.direct_forces
+        self.regress_stress = backbone.regress_stress
+        self.direct_stress = backbone.direct_stress
+        self.dens_enabled = backbone.dens_enabled
+        if self.dens_enabled:
+            self.dens_mlp = nn.Sequential(
+                Linear(
+                    backbone.node_to_edge_ratio * backbone.d_pet,
+                    backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet,
+                ),
+                nn.SiLU(),
+                Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
+            )
 
     @conditional_grad(torch.enable_grad())
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        energy = self.energy_scale * emb["position_sum"]
+        atomic_energies = self.mlp(emb["node_features"]).squeeze(-1)
+        energy = torch.index_add(
+            torch.zeros((len(data["cell"]),), device=atomic_energies.device),
+            0,
+            data["batch"],
+            atomic_energies,
+        )
         outputs = {"energy": energy}
 
         if self.regress_forces and not self.direct_forces:
-            total_energy = energy.sum()
-            forces = -torch.autograd.grad(
-                total_energy,
-                data["pos"],
-                create_graph=self.training,
-                retain_graph=True,
-            )[0]
+            if self.regress_stress and not self.direct_stress:
+                grads = torch.autograd.grad(
+                    [energy.sum()],
+                    [data["pos"], emb["displacement"]],
+                    create_graph=self.training,
+                )
+                forces = -grads[0]
+                virial = grads[1].view(-1, 3, 3)
+                volume = torch.det(data["cell"]).abs().unsqueeze(-1)
+                stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
+                if "dens_batch_mask" in data:
+                    stress = torch.where(
+                        data["dens_batch_mask"].view(-1, 1),
+                        torch.zeros_like(stress),
+                        stress,
+                    )
+                outputs["stress"] = stress
+            else:
+                forces = -torch.autograd.grad(
+                    energy.sum(),
+                    data["pos"],
+                    create_graph=self.training,
+                    retain_graph=True,
+                )[0]
+
+            if self.dens_enabled:
+                noise_mask = (
+                    data["noise_mask"]
+                    if "noise_mask" in data
+                    else torch.zeros(
+                        emb["node_features"].shape[0],
+                        device=emb["node_features"].device,
+                        dtype=torch.bool,
+                    )
+                ).view(-1, 1)
+                dens_forces = self.dens_mlp(emb["node_features"])
+                forces = torch.where(noise_mask, dens_forces, forces)
             outputs["forces"] = forces
 
-        if self.regress_stress:
-            stress = data["pos"].new_zeros((_num_graphs(data), 3, 3))
-            outputs["stress"] = stress + 0.0 * energy.sum()
+        elif self.regress_stress and not self.direct_stress:
+            displacement = emb["displacement"]
+            virial = torch.autograd.grad(
+                energy.sum(),
+                displacement,
+                create_graph=self.training,
+                retain_graph=True,
+            )[0].view(-1, 3, 3)
+            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
+            stress = (virial / volume.view(-1, 1, 1)).view(-1, 9)
+            if "dens_batch_mask" in data:
+                stress = torch.where(
+                    data["dens_batch_mask"].view(-1, 1),
+                    torch.zeros_like(stress),
+                    stress,
+                )
+            outputs["stress"] = stress
 
-        return outputs
+        return {
+            "energy": {"energy": outputs["energy"]},
+            "forces": {"forces": outputs["forces"]},
+            "stress": {"stress": outputs["stress"]},
+        }
