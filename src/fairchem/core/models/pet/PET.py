@@ -1382,8 +1382,9 @@ class PETGradientEnergyForceStressHead(PETEnergyHead):
                 )
             outputs["stress"] = stress
 
-        return {
-            "energy": {"energy": outputs["energy"]},
-            "forces": {"forces": outputs["forces"]},
-            "stress": {"stress": outputs["stress"]},
-        }
+        nested_outputs = {"energy": {"energy": outputs["energy"]}}
+        if "forces" in outputs:
+            nested_outputs["forces"] = {"forces": outputs["forces"]}
+        if "stress" in outputs:
+            nested_outputs["stress"] = {"stress": outputs["stress"]}
+        return nested_outputs

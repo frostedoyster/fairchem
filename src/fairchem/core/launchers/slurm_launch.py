@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import signal
@@ -75,6 +76,10 @@ def map_job_config_to_dist_config(job_cfg: JobConfig) -> dict:
         "shared_file_dir": os.path.join(job_cfg.run_dir, job_cfg.timestamp_id),
         "array_job_num": job_cfg.metadata.array_job_num,
     }
+
+
+def _timeout_min_from_hours(timeout_hr: float) -> int:
+    return max(1, math.ceil(timeout_hr * 60))
 
 
 def remove_runner_state_from_submission(log_folder: str, job_id: str) -> None:
@@ -275,7 +280,7 @@ def slurm_launch(cfg: DictConfig, log_dir: str) -> list:
     executor.update_parameters(
         name=cfg.job.run_name,
         mem_gb=scheduler_cfg.slurm.mem_gb,
-        timeout_min=scheduler_cfg.slurm.timeout_hr * 60,
+        timeout_min=_timeout_min_from_hours(scheduler_cfg.slurm.timeout_hr),
         slurm_partition=scheduler_cfg.slurm.partition,
         gpus_per_node=scheduler_cfg.ranks_per_node,
         cpus_per_task=scheduler_cfg.slurm.cpus_per_task,

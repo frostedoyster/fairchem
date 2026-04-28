@@ -336,7 +336,10 @@ def random_o3_transform(data_object: AtomicData, config) -> AtomicData:
     if "cell" in data_object:
         data_object.cell = torch.bmm(data_object.cell, transformation.transpose(-1, -2))
 
-    vector_keys = config.get("vector_keys", ["forces"])
+    vector_keys = list(config.get("vector_keys", ["forces"]))
+    for dens_vector_key in ("force_data", "noise_vec"):
+        if dens_vector_key in data_object and dens_vector_key not in vector_keys:
+            vector_keys.append(dens_vector_key)
     rank2_keys = config.get("rank2_keys", ["stress"])
     _rotate_vectors(data_object, vector_keys, transformation)
     _rotate_rank2_tensors(data_object, rank2_keys, transformation)
@@ -345,13 +348,13 @@ def random_o3_transform(data_object: AtomicData, config) -> AtomicData:
 
 
 def dens_transform(data_object: AtomicData, config) -> AtomicData:
-    """Apply DeNS-style position noise and rewrite force targets on noisy atoms.
+    """Apply DeNS-style position noise and store a separate denoising target.
 
     This is intended as a collate-time transform so noise is resampled every epoch.
     Graphs selected for DeNS get:
     - noisy positions on a subset of atoms
     - original forces copied to ``force_data`` for model-side force encoding
-    - atomwise ``forces`` targets replaced by the denoising vector on noisy atoms
+    - atomwise added noise stored in ``noise_vec`` for DeNS loss computation
     - optional masking of graph-level targets such as energy/stress via ``inf``
     """
 
@@ -458,14 +461,7 @@ def dens_transform(data_object: AtomicData, config) -> AtomicData:
     noise = torch.randn_like(data_object.pos) * noise_std
     noise = noise * noise_mask.unsqueeze(-1).to(dtype)
     data_object.pos = data_object.pos + noise
-
-    if "forces" in data_object:
-        denoising_target = -noise
-        data_object.forces = torch.where(
-            noise_mask.unsqueeze(-1),
-            denoising_target,
-            data_object.forces,
-        )
+    data_object.noise_vec = noise
 
     if mask_energy and "energy" in data_object:
         data_object.energy = data_object.energy.clone()

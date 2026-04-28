@@ -53,7 +53,7 @@ class DistributedInitMethod(StrEnum):
 @dataclass
 class SlurmConfig:
     mem_gb: int = 80
-    timeout_hr: int = 168
+    timeout_hr: float = 168.0
     cpus_per_task: int = 8
     partition: Optional[str] = (
         None  # omegaconf in python 3.9 does not backport annotations

@@ -31,7 +31,8 @@ from fairchem.core.launchers.cluster.ray_cluster import RayCluster
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from fairchem.core.launchers.api import SchedulerConfig, SlurmConfig
+from fairchem.core.launchers.api import SchedulerConfig, SlurmConfig
+from fairchem.core.launchers.slurm_launch import _timeout_min_from_hours
 
 
 @ray.remote
@@ -205,7 +206,7 @@ def ray_on_slurm_launch(config: DictConfig, log_dir: str):
     cluster_reqs = {
         "slurm_account": slurm_config.account,
         "slurm_qos": slurm_config.qos,
-        "timeout_min": slurm_config.timeout_hr * 60,
+        "timeout_min": _timeout_min_from_hours(slurm_config.timeout_hr),
         "mem_gb": slurm_config.mem_gb,
         "nodes": scheduler_config.num_nodes,
         "gpus_per_task": scheduler_config.ranks_per_node,

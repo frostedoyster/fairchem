@@ -90,6 +90,8 @@ class Task:
     datasets: list[str]
     loss_fn: torch.nn.Module | None = None
     element_references: Optional[ElementReferences] = None
+    dens_normalizer: Optional[Normalizer] = None
+    dens_coefficient: Optional[float] = None
     metrics: list[str] = field(default_factory=list)
     train_on_free_atoms: bool = True
     eval_on_free_atoms: bool = True
@@ -232,6 +234,57 @@ def get_output_masks(
     return output_masks
 
 
+def _compute_dens_hybrid_force_loss(
+    task: Task,
+    pred_for_task: torch.Tensor,
+    target: torch.Tensor,
+    mult_mask: torch.Tensor,
+    batch: AtomicData,
+) -> torch.Tensor:
+    if task.loss_fn is None or not hasattr(task.loss_fn, "loss_fn"):
+        raise ValueError("DeNS hybrid force loss requires a DDPMTLoss-style wrapper.")
+    if getattr(task.loss_fn, "reduction", None) != "mean":
+        raise ValueError("DeNS hybrid force loss currently requires reduction='mean'.")
+
+    dens_normalizer = (
+        task.dens_normalizer if task.dens_normalizer is not None else task.normalizer
+    )
+    dens_target = dens_normalizer.norm(batch.noise_vec.clone()).view_as(target)
+    noise_mask = batch.noise_mask.view(-1, 1)
+    target = torch.where(noise_mask, dens_target, target)
+
+    force_mult = float(task.loss_fn.coefficient)
+    dens_mult = (
+        float(task.dens_coefficient)
+        if task.dens_coefficient is not None
+        else force_mult
+    )
+
+    per_sample_loss = task.loss_fn.loss_fn(
+        pred_for_task,
+        torch.nan_to_num(target, posinf=0.0, neginf=0.0),
+        batch.natoms,
+    )
+    sample_weights = torch.full(
+        (pred_for_task.shape[0],),
+        force_mult,
+        device=pred_for_task.device,
+        dtype=pred_for_task.dtype,
+    )
+    sample_weights[batch.noise_mask] = dens_mult
+    weighted_loss = per_sample_loss * sample_weights * mult_mask
+
+    num_samples = per_sample_loss[mult_mask].numel()
+    reduced_loss = task.loss_fn._ddp_mean(num_samples, weighted_loss.sum())
+
+    found_nans_or_infs = not torch.all(reduced_loss.isfinite())
+    if found_nans_or_infs is True:
+        logging.warning("Found nans while computing DeNS hybrid force loss")
+        reduced_loss = torch.nan_to_num(reduced_loss, nan=0.0)
+
+    return reduced_loss
+
+
 def compute_loss(
     tasks: Sequence[Task], predictions: dict[str, torch.Tensor], batch: AtomicData
 ) -> dict[str, float]:
@@ -285,12 +338,25 @@ def compute_loss(
             mult_mask = free_mask & output_mask
         else:
             mult_mask = output_mask
-        loss_dict[task.name] = task.loss_fn(
-            pred_for_task,
-            target,
-            mult_mask=mult_mask,
-            natoms=batch.natoms,
-        )
+
+        if (
+            task.name == "forces"
+            and task.level == "atom"
+            and hasattr(batch, "denoising_pos_forward")
+            and bool(batch.denoising_pos_forward.any())
+            and hasattr(batch, "noise_mask")
+            and hasattr(batch, "noise_vec")
+        ):
+            loss_dict[task.name] = _compute_dens_hybrid_force_loss(
+                task, pred_for_task, target, mult_mask, batch
+            )
+        else:
+            loss_dict[task.name] = task.loss_fn(
+                pred_for_task,
+                target,
+                mult_mask=mult_mask,
+                natoms=batch.natoms,
+            )
 
     # Sanity check to make sure the compute graph is correct.
     for lc in loss_dict.values():
