@@ -631,6 +631,36 @@ def cutoff_func_cosine(
     return f
 
 
+def cutoff_func_envelope(r, r_max: float, p: int = 6):
+    """
+    NequIP/MACE-style polynomial radial envelope.
+
+    Args:
+        r: distances (scalar, list, or torch.Tensor)
+        r_max: cutoff radius
+        p: polynomial cutoff parameter
+
+    Returns:
+        torch.Tensor with the same shape as r
+    """
+    if r_max <= 0:
+        raise ValueError("r_max must be positive.")
+    if int(p) != p or p < 1:
+        raise ValueError("p must be a positive integer.")
+
+    r = torch.as_tensor(r)
+    x = r / r_max
+
+    env = (
+        1.0
+        - 0.5 * (p + 1) * (p + 2) * x.pow(p)
+        + p * (p + 2) * x.pow(p + 1)
+        - 0.5 * p * (p + 1) * x.pow(p + 2)
+    )
+
+    return torch.where(r < r_max, env, torch.zeros_like(env))
+
+
 def get_nef_indices(
     centers: torch.Tensor, n_nodes: int, n_edges_per_node: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -913,11 +943,11 @@ class PETBackbone(nn.Module, BackboneInterface):
         self.extra_config = kwargs
 
         # hardcoded hypers
-        self.d_pet = 256
+        self.d_pet = 512
         self.node_to_edge_ratio = 4
         self.feedforward_ratio = 2
-        self.num_gnn_layers = 3
-        self.num_attention_layers = 1
+        self.num_gnn_layers = 8
+        self.num_attention_layers = 2
         self.cutoff_width = 0.5
         self.num_heads = 8
         self.cutoff_function = "cosine"
@@ -945,12 +975,12 @@ class PETBackbone(nn.Module, BackboneInterface):
         )
 
         self.combination_norms = torch.nn.ModuleList(
-            [torch.nn.LayerNorm(self.feedforward_ratio * self.d_pet) for _ in range(self.num_gnn_layers)]
+            [torch.nn.LayerNorm(2 * self.d_pet) for _ in range(self.num_gnn_layers)]
         )
         self.combination_mlps = torch.nn.ModuleList(
             [
                 torch.nn.Sequential(
-                    Linear(self.feedforward_ratio * self.d_pet, self.feedforward_ratio * self.d_pet),
+                    Linear(2 * self.d_pet, self.feedforward_ratio * self.d_pet),
                     torch.nn.SiLU(),
                     Linear(self.feedforward_ratio * self.d_pet, self.d_pet),
                 )
@@ -1060,7 +1090,7 @@ class PETBackbone(nn.Module, BackboneInterface):
 
         edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=-1))
         if self.cutoff_function.lower() == "cosine":
-            cutoff_factors = cutoff_func_cosine(edge_distances, self.cutoff, self.cutoff_width)
+            cutoff_factors = cutoff_func_envelope(edge_distances, self.cutoff)
         else:
             raise ValueError(
                 f"Unknown cutoff function type: {self.cutoff_function}. "
