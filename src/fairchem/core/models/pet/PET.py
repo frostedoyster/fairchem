@@ -57,8 +57,10 @@ class DummyModule(torch.nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, dim_feedforward: int, activation: str) -> None:
+    def __init__(self, d_model: int, activation: str) -> None:
         super().__init__()
+
+        dim_feedforward = 2 * d_model
 
         # Check if activation is "swiglu" string
         if activation.lower() == "swiglu":
@@ -168,7 +170,7 @@ class TransformerLayer(torch.nn.Module):
     :param d_model: The dimension of the model.
     :param n_heads: The number of attention heads.
     :param dim_node_features: The dimension of the node features.
-    :param dim_feedforward: The dimension of the feedforward network.
+    :param dim_edge_features: The dimension of the edge features.
     :param norm: The normalization type, either "LayerNorm" or "RMSNorm".
     :param activation: The activation function, either "SiLU" or "SwiGLU".
     :param transformer_type: The type of transformer, either "PostLN" or "PreLN".
@@ -180,7 +182,7 @@ class TransformerLayer(torch.nn.Module):
         d_model: int,
         n_heads: int,
         dim_node_features: int,
-        dim_feedforward: int = 512,
+        dim_edge_features: int,
         norm: str = "LayerNorm",
         activation: str = "SiLU",
         transformer_type: str = "PostLN",
@@ -192,91 +194,72 @@ class TransformerLayer(torch.nn.Module):
         self.d_model = d_model
         norm_class = getattr(nn, norm)
         self.norm_attention = norm_class(d_model)
-        self.norm_mlp = norm_class(d_model)
-        self.mlp = FeedForward(d_model, dim_feedforward, activation)
-        self.expanded_node_features = False
-        if dim_node_features != d_model:
-            self.expanded_node_features = True
-            self.center_contraction = Linear(dim_node_features, d_model)
-            self.center_expansion = Linear(d_model, dim_node_features)
-            self.norm_center_features = norm_class(dim_node_features)
-            self.center_mlp = FeedForward(
-                dim_node_features, 2 * dim_node_features, activation
-            )
-        else:
-            self.center_contraction = torch.nn.Identity()
-            self.center_expansion = torch.nn.Identity()
-            self.norm_center_features = torch.nn.Identity()
-            self.center_mlp = torch.nn.Identity()
+        self.edge_contraction = Linear(dim_edge_features, d_model)
+        self.edge_expansion = Linear(d_model, dim_edge_features)
+        self.norm_edge_features = norm_class(dim_edge_features)
+        self.edge_mlp = FeedForward(dim_edge_features, activation)
+
+        self.norm_triplet_features = norm_class(d_model)
+        self.triplet_mlp = FeedForward(d_model, activation)
+
+        self.center_contraction = Linear(dim_node_features, d_model)
+        self.center_expansion = Linear(d_model, dim_node_features)
+        self.norm_center_features = norm_class(dim_node_features)
+        self.center_mlp = FeedForward(dim_node_features, activation)
 
     def _forward_pre_ln_impl(
         self,
         node_embeddings: torch.Tensor,
         edge_embeddings: torch.Tensor,
+        triplet_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # print("before contraction", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
 
-        if self.expanded_node_features:
-            input_node_embeddings = self.center_contraction(node_embeddings)
-        else:
-            input_node_embeddings = node_embeddings
+        input_node_embeddings = self.center_contraction(node_embeddings)
+        input_edge_embeddings = self.edge_contraction(edge_embeddings)
 
         # print("before expanded", input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
 
-        tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
+        tokens = torch.cat(
+            [input_node_embeddings, input_edge_embeddings, triplet_embeddings],
+            dim=1,
+        )
         new_tokens = self.attention(
             self.norm_attention(tokens), cutoff_factors, use_manual_attention
         )
-        output_node_embeddings, output_edge_embeddings = torch.split(
-            new_tokens, [1, new_tokens.shape[1] - 1], dim=1
-        )
-        if self.expanded_node_features:
-            # print("expanded node features", flush=True)
-            output_node_embeddings = node_embeddings + self.center_expansion(
-                output_node_embeddings
-            )
-            output_node_embeddings = output_node_embeddings + self.center_mlp(
-                self.norm_center_features(output_node_embeddings)
-            )
+        split_sizes = [1, edge_embeddings.shape[1], triplet_embeddings.shape[1]]
+        split_tokens = torch.split(new_tokens, split_sizes, dim=1)
+        output_node_embeddings = split_tokens[0]
+        output_edge_embeddings = split_tokens[1]
+        output_triplet_embeddings = split_tokens[2]
 
-        output_edge_embeddings = edge_embeddings + output_edge_embeddings
-        output_edge_embeddings = output_edge_embeddings + self.mlp(
-            self.norm_mlp(output_edge_embeddings)
+        output_node_embeddings = node_embeddings + self.center_expansion(
+            output_node_embeddings
+        )
+        output_node_embeddings = output_node_embeddings + self.center_mlp(
+            self.norm_center_features(output_node_embeddings)
+        )
+
+        output_edge_embeddings = edge_embeddings + self.edge_expansion(
+            output_edge_embeddings
+        )
+        output_edge_embeddings = output_edge_embeddings + self.edge_mlp(
+            self.norm_edge_features(output_edge_embeddings)
+        )
+
+        output_triplet_embeddings = triplet_embeddings + output_triplet_embeddings
+        output_triplet_embeddings = (
+            output_triplet_embeddings
+            + self.triplet_mlp(
+                self.norm_triplet_features(output_triplet_embeddings)
+            )
         )
 
         # print("after expanded", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
 
-        return output_node_embeddings, output_edge_embeddings
-
-    def _forward_post_ln_impl(
-        self,
-        node_embeddings: torch.Tensor,
-        edge_embeddings: torch.Tensor,
-        cutoff_factors: torch.Tensor,
-        use_manual_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.expanded_node_features:
-            input_node_embeddings = self.center_contraction(node_embeddings)
-        else:
-            input_node_embeddings = node_embeddings
-        tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
-        tokens = self.norm_attention(
-            tokens + self.attention(tokens, cutoff_factors, use_manual_attention)
-        )
-        tokens = self.norm_mlp(tokens + self.mlp(tokens))
-        output_node_embeddings, output_edge_embeddings = torch.split(
-            tokens, [1, tokens.shape[1] - 1], dim=1
-        )
-        if self.expanded_node_features:
-            output_node_embeddings = node_embeddings + self.center_expansion(
-                output_node_embeddings
-            )
-            output_node_embeddings = output_node_embeddings + self.center_mlp(
-                self.norm_center_features(output_node_embeddings)
-            )
-        return output_node_embeddings, output_edge_embeddings
+        return output_node_embeddings, output_edge_embeddings, output_triplet_embeddings
 
     def forward(
         self,
@@ -284,7 +267,8 @@ class TransformerLayer(torch.nn.Module):
         edge_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        triplet_embeddings: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for a single Transformer layer.
 
@@ -302,21 +286,17 @@ class TransformerLayer(torch.nn.Module):
             - The output node embeddings, of shape (batch_size, d_model)
             - The output edge embeddings, of shape (batch_size, seq_length, d_model)
         """
-        if self.transformer_type == "PostLN":
-            node_embeddings, edge_embeddings = self._forward_post_ln_impl(
-                node_embeddings,
-                edge_embeddings,
-                cutoff_factors,
-                use_manual_attention,
-            )
         if self.transformer_type == "PreLN":
-            node_embeddings, edge_embeddings = self._forward_pre_ln_impl(
+            node_embeddings, edge_embeddings, triplet_embeddings = self._forward_pre_ln_impl(
                 node_embeddings,
                 edge_embeddings,
+                triplet_embeddings,
                 cutoff_factors,
                 use_manual_attention,
             )
-        return node_embeddings, edge_embeddings
+        else:
+            raise NotImplementedError(f"Transformer type {self.transformer_type} not implemented")
+        return node_embeddings, edge_embeddings, triplet_embeddings
 
 
 class Transformer(torch.nn.Module):
@@ -327,7 +307,7 @@ class Transformer(torch.nn.Module):
     :param num_layers: The number of transformer layers.
     :param n_heads: The number of attention heads.
     :param dim_node_features: The dimension of the node features.
-    :param dim_feedforward: The dimension of the feedforward network.
+    :param dim_edge_features: The dimension of the edge features.
     :param norm: The normalization type, either "LayerNorm" or "RMSNorm".
     :param activation: The activation function, either "SiLU" or "SwiGLU".
     :param transformer_type: The type of transformer, either "PostLN" or "PreLN".
@@ -342,7 +322,7 @@ class Transformer(torch.nn.Module):
         num_layers: int,
         n_heads: int,
         dim_node_features: int,
-        dim_feedforward: int = 512,
+        dim_edge_features: int,
         norm: str = "LayerNorm",
         activation: str = "SiLU",
         transformer_type: str = "PostLN",
@@ -374,7 +354,7 @@ class Transformer(torch.nn.Module):
                     d_model=d_model,
                     n_heads=n_heads,
                     dim_node_features=dim_node_features,
-                    dim_feedforward=dim_feedforward,
+                    dim_edge_features=dim_edge_features,
                     norm=norm,
                     activation=activation,
                     transformer_type=transformer_type,
@@ -390,7 +370,8 @@ class Transformer(torch.nn.Module):
         edge_embeddings: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        triplet_embeddings: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Transformer.
 
@@ -409,10 +390,14 @@ class Transformer(torch.nn.Module):
             - The output edge embeddings, of shape (batch_size, seq_length, d_model)
         """
         for layer in self.layers:
-            node_embeddings, edge_embeddings = layer(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+            node_embeddings, edge_embeddings, triplet_embeddings = layer(
+                node_embeddings,
+                edge_embeddings,
+                cutoff_factors,
+                use_manual_attention,
+                triplet_embeddings,
             )
-        return node_embeddings, edge_embeddings
+        return node_embeddings, edge_embeddings, triplet_embeddings
 
 
 class CartesianTransformer(torch.nn.Module):
@@ -424,7 +409,7 @@ class CartesianTransformer(torch.nn.Module):
     :param d_model: The dimension of the model.
     :param n_head: The number of attention heads.
     :param dim_node_features: The dimension of the node features.
-    :param dim_feedforward: The dimension of the feedforward network.
+    :param dim_edge_features: The dimension of the edge features.
     :param n_layers: The number of transformer layers.
     :param norm: The normalization type, either "LayerNorm" or "RMSNorm".
     :param activation: The activation function, either "SiLU" or "SwiGLU".
@@ -441,7 +426,7 @@ class CartesianTransformer(torch.nn.Module):
         d_model: int,
         n_head: int,
         dim_node_features: int,
-        dim_feedforward: int,
+        dim_edge_features: int,
         n_layers: int,
         norm: str,
         activation: str,
@@ -459,7 +444,7 @@ class CartesianTransformer(torch.nn.Module):
             num_layers=n_layers,
             n_heads=n_head,
             dim_node_features=dim_node_features,
-            dim_feedforward=dim_feedforward,
+            dim_edge_features=dim_edge_features,
             norm=norm,
             activation=activation,
             transformer_type=transformer_type,
@@ -493,7 +478,10 @@ class CartesianTransformer(torch.nn.Module):
         edge_distances: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        triplet_features: torch.Tensor,
+        triplet_mask: torch.Tensor,
+        triplet_cutoff_factors: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the CartesianTransformer.
 
@@ -547,16 +535,18 @@ class CartesianTransformer(torch.nn.Module):
         padding_mask_with_central_token = torch.ones(
             padding_mask.shape[0], dtype=torch.bool, device=padding_mask.device
         )
-        total_padding_mask = torch.cat(
-            [padding_mask_with_central_token[:, None], padding_mask], dim=1
-        )
+        masks_to_cat = [padding_mask_with_central_token[:, None], padding_mask]
+        masks_to_cat.append(triplet_mask)
+        total_padding_mask = torch.cat(masks_to_cat, dim=1)
 
         cutoff_subfactors = torch.ones(
             padding_mask.shape[0],
             dtype=cutoff_factors.dtype,
             device=padding_mask.device,
         )
-        cutoff_factors = torch.cat([cutoff_subfactors[:, None], cutoff_factors], dim=1)
+        cutoff_values_to_cat = [cutoff_subfactors[:, None], cutoff_factors]
+        cutoff_values_to_cat.append(triplet_cutoff_factors)
+        cutoff_factors = torch.cat(cutoff_values_to_cat, dim=1)
         cutoff_factors[~total_padding_mask] = 0.0
 
         cutoff_factors = cutoff_factors[:, None, :]
@@ -566,17 +556,18 @@ class CartesianTransformer(torch.nn.Module):
 
         # print("before attention", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
 
-        output_node_embeddings, output_edge_embeddings = self.trans(
+        output_node_embeddings, output_edge_embeddings, output_triplet_features = self.trans(
             node_embeddings[:, None, :],
             edge_tokens,
             cutoff_factors=cutoff_factors,
             use_manual_attention=use_manual_attention,
+            triplet_embeddings=triplet_features,
         )
 
         # print("after attention", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
 
         output_node_embeddings = output_node_embeddings.squeeze(1)
-        return output_node_embeddings, output_edge_embeddings
+        return output_node_embeddings, output_edge_embeddings, output_triplet_features
 
 
 def manual_attention(
@@ -914,6 +905,7 @@ class PETBackbone(nn.Module, BackboneInterface):
 
         # hardcoded hypers
         self.d_pet = 256
+        self.d_triplet = 64
         self.node_to_edge_ratio = 4
         self.feedforward_ratio = 2
         self.num_gnn_layers = 3
@@ -943,6 +935,21 @@ class PETBackbone(nn.Module, BackboneInterface):
             Linear(self.d_pet, self.d_pet),
 
         )
+        self.triplet_center_embedder = nn.Embedding(self.max_num_elements, self.d_triplet)
+        self.triplet_first_embedder = nn.Embedding(self.max_num_elements, self.d_triplet)
+        self.triplet_second_embedder = nn.Embedding(self.max_num_elements, self.d_triplet)
+        self.triplet_directional1_embedder = Linear(4, self.d_triplet)
+        self.triplet_directional2_embedder = Linear(4, self.d_triplet)
+        self.triplet_compressor = torch.nn.Sequential(
+            Linear(5 * self.d_triplet, self.d_triplet),
+            torch.nn.SiLU(),
+            Linear(self.d_triplet, self.d_triplet),
+            torch.nn.SiLU(),
+            Linear(self.d_triplet, self.d_triplet),
+        )
+        self.triplet_to_edge = Linear(self.d_triplet, self.d_pet)
+        self.triplet_to_edge.linear_layer.weight.data.zero_()
+        self.triplet_to_edge.linear_layer.bias.data.zero_()
 
         self.combination_norms = torch.nn.ModuleList(
             [torch.nn.LayerNorm(self.feedforward_ratio * self.d_pet) for _ in range(self.num_gnn_layers)]
@@ -962,10 +969,10 @@ class PETBackbone(nn.Module, BackboneInterface):
                 CartesianTransformer(
                     self.cutoff,
                     self.cutoff_width,
-                    self.d_pet,
+                    self.d_triplet,
                     self.num_heads,
                     self.node_to_edge_ratio * self.d_pet,
-                    self.feedforward_ratio * self.d_pet,
+                    self.d_pet,
                     self.num_attention_layers,
                     "RMSNorm",
                     "SwiGLU",
@@ -1003,6 +1010,66 @@ class PETBackbone(nn.Module, BackboneInterface):
 
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         pass
+
+    def _build_triplet_features(
+        self,
+        atomic_numbers: torch.Tensor,
+        element_indices_neighbors: torch.Tensor,
+        edge_vectors: torch.Tensor,
+        edge_distances: torch.Tensor,
+        nef_mask: torch.Tensor,
+        cutoff_factors: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        max_neighbors = edge_vectors.shape[1]
+
+        triplet_mask = nef_mask[:, :, None] & nef_mask[:, None, :]
+        triplet_cutoff_factors = cutoff_factors[:, :, None] * cutoff_factors[:, None, :]
+
+        center_features = self.triplet_center_embedder(atomic_numbers)[:, None, None, :]
+        center_features = center_features.expand(-1, max_neighbors, max_neighbors, -1)
+
+        first_features = self.triplet_first_embedder(element_indices_neighbors)
+        first_features = first_features[:, :, None, :].expand(
+            -1, -1, max_neighbors, -1
+        )
+
+        second_features = self.triplet_second_embedder(element_indices_neighbors)
+        second_features = second_features[:, None, :, :].expand(
+            -1, max_neighbors, -1, -1
+        )
+
+        normalizer = 0.5 * self.cutoff
+        first_geometry = torch.cat(
+            [edge_vectors, edge_distances.unsqueeze(-1)], dim=-1
+        ) / normalizer
+        second_geometry = first_geometry
+        first_geometry = first_geometry[:, :, None, :].expand(
+            -1, -1, max_neighbors, -1
+        )
+        second_geometry = second_geometry[:, None, :, :].expand(
+            -1, max_neighbors, -1, -1
+        )
+
+        triplet_features = torch.cat(
+            [
+                center_features,
+                first_features,
+                second_features,
+                self.triplet_directional1_embedder(first_geometry),
+                self.triplet_directional2_embedder(second_geometry),
+            ],
+            dim=-1,
+        )
+        triplet_features = self.triplet_compressor(triplet_features)
+        return (
+            triplet_features.reshape(
+                triplet_features.shape[0], max_neighbors * max_neighbors, -1
+            ),
+            triplet_mask.reshape(triplet_mask.shape[0], max_neighbors * max_neighbors),
+            triplet_cutoff_factors.reshape(
+                triplet_cutoff_factors.shape[0], max_neighbors * max_neighbors
+            ),
+        )
 
     def _forward_impl(self, data: AtomicData) -> dict[str, torch.Tensor]:
         positions = data["pos"]
@@ -1140,6 +1207,18 @@ class PETBackbone(nn.Module, BackboneInterface):
         ], dim=-1)
         edge_features = self.edge_compressor(edge_features)
         # edge_features = edge_features + self.edge_mlp(edge_features)
+        (
+            triplet_features,
+            triplet_mask,
+            triplet_cutoff_factors,
+        ) = self._build_triplet_features(
+            atomic_numbers,
+            element_indices_neighbors,
+            edge_vectors,
+            edge_distances,
+            nef_mask,
+            cutoff_factors,
+        )
         
         # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
         # print("before", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
@@ -1147,7 +1226,7 @@ class PETBackbone(nn.Module, BackboneInterface):
         for combination_norm, combination_mlp, gnn_layer in zip(
             self.combination_norms, self.combination_mlps, self.gnn_layers, strict=True
         ):
-            node_features, edge_features = gnn_layer(
+            node_features, edge_features, triplet_features = gnn_layer(
                 node_features,
                 edge_features,
                 element_indices_neighbors,
@@ -1156,6 +1235,9 @@ class PETBackbone(nn.Module, BackboneInterface):
                 edge_distances,
                 cutoff_factors,
                 use_manual_attention,
+                triplet_features,
+                triplet_mask,
+                triplet_cutoff_factors,
             )
 
             # print("after gnn", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
@@ -1181,6 +1263,19 @@ class PETBackbone(nn.Module, BackboneInterface):
             # print("after combination", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
         
         # print(flush=True)
+
+        num_edge_slots = edge_features.shape[1]
+        triplet_features = triplet_features.reshape(
+            triplet_features.shape[0],
+            num_edge_slots,
+            num_edge_slots,
+            triplet_features.shape[-1],
+        )
+        second_edge_cutoff_factors = cutoff_factors[:, None, :, None]
+        triplet_edge_features = torch.sum(
+            triplet_features * second_edge_cutoff_factors, dim=2
+        )
+        edge_features = edge_features + self.triplet_to_edge(triplet_edge_features)
 
         edge_features = edge_features * cutoff_factors.unsqueeze(-1)
         node_features = node_features + self.edge_expander(torch.sum(edge_features, dim=1))
