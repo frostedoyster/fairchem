@@ -26,65 +26,35 @@ if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit.mlip_unit import Task
 
 
-AVAILABLE_NORMALIZATIONS = ["LayerNorm", "RMSNorm"]
-AVAILABLE_TRANSFORMER_TYPES = ["PostLN", "PreLN"]
-AVAILABLE_ACTIVATIONS = ["SiLU", "SwiGLU"]
-
-
 class Linear(torch.nn.Module):
 
-    def __init__(self, n_feat_in, n_feat_out, scale_factor=1.0):
+    def __init__(self, n_feat_in, n_feat_out):
         super().__init__()
         self.linear_layer = torch.nn.Linear(n_feat_in, n_feat_out)
         self.n_feat_in = n_feat_in if n_feat_in > 0 else 1
-        self.linear_layer.weight.data.normal_(0.0, (scale_factor * self.n_feat_in) ** (-0.5))
+        self.linear_layer.weight.data.normal_(0.0, self.n_feat_in ** (-0.5))
         self.linear_layer.bias.data.zero_()
 
     def forward(self, x):
         return self.linear_layer(x)
 
 
-class DummyModule(torch.nn.Module):
-    """Dummy torch module to make torchscript happy.
-    This model should never be run"""
-
-    def __init__(self) -> None:
-        super(DummyModule, self).__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise RuntimeError("This model should never be run")
-
-
-
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, dim_feedforward: int, activation: str) -> None:
+    def __init__(self, d_model: int) -> None:
         super().__init__()
+        dim_feedforward = 2 * d_model
 
-        # Check if activation is "swiglu" string
-        if activation.lower() == "swiglu":
-            # SwiGLU mode: single projection produces both "value" and "gate"
-            self.w_in = Linear(d_model, 2 * dim_feedforward)
-            self.w_out = Linear(dim_feedforward, d_model)
-            self.activation = torch.nn.Identity()
-            self.is_swiglu = True
-        else:
-            # Standard mode: regular activation function
-            self.w_in = Linear(d_model, dim_feedforward)
-            self.w_out = Linear(dim_feedforward, d_model)
-            self.activation = getattr(F, activation.lower())
-            self.is_swiglu = False
+        # SwiGLU: single projection produces both "value" and "gate"
+        self.w_in = Linear(d_model, 2 * dim_feedforward)
+        self.w_out = Linear(dim_feedforward, d_model)
+        self.activation = torch.nn.Identity()
+        self.is_swiglu = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.is_swiglu:
-            # SwiGLU activation: split into value and gate
-            v, g = self.w_in(x).chunk(2, dim=-1)
-            x = v * torch.sigmoid(g)
-            x = self.w_out(x)
-        else:
-            # Standard activation
-            x = self.w_in(x)
-            x = self.activation(x)
-            x = self.w_out(x)
+        # SwiGLU activation: split into value and gate
+        v, g = self.w_in(x).chunk(2, dim=-1)
+        x = v * torch.sigmoid(g)
+        x = self.w_out(x)
         return x
 
 
@@ -120,13 +90,13 @@ class AttentionBlock(nn.Module):
         self.head_dim = total_dim // num_heads
 
     def forward(
-        self, x: torch.Tensor, cutoff_factors: torch.Tensor, use_manual_attention: bool
+        self, x: torch.Tensor, log_cutoff_factors: torch.Tensor, use_manual_attention: bool
     ) -> torch.Tensor:
         """
         Forward pass for the attention block.
 
         :param x: The input tensor, of shape (batch_size, seq_length, total_dim)
-        :param cutoff_factors: The cutoff factors for the edges, of shape
+        :param log_cutoff_factors: The cutoff factors for the edges, of shape
             (batch_size, seq_length, seq_length)
         :param use_manual_attention: Whether to use the manual attention implementation
             (which supports double backward, needed for training with conservative
@@ -142,18 +112,16 @@ class AttentionBlock(nn.Module):
         x = x.permute(2, 0, 3, 1, 4)
 
         queries, keys, values = x[0], x[1], x[2]
-        attn_weights = torch.clamp(cutoff_factors[:, None, :, :], self.epsilon)
-        attn_weights = torch.log(attn_weights)
         if use_manual_attention:
             x = manual_attention(
-                queries, keys, values, attn_weights, self.temperature
+                queries, keys, values, log_cutoff_factors[:, None, None, :], self.temperature
             )
         else:
             x = torch.nn.functional.scaled_dot_product_attention(
                 queries,
                 keys,
                 values,
-                attn_mask=attn_weights,
+                attn_mask=log_cutoff_factors[:, None, None, :],
                 scale=1.0 / (self.head_dim**0.5 * self.temperature),
             )
         x = x.transpose(1, 2).reshape(initial_shape)
@@ -180,29 +148,21 @@ class TransformerLayer(torch.nn.Module):
         d_model: int,
         n_heads: int,
         dim_node_features: int,
-        dim_feedforward: int = 512,
-        norm: str = "LayerNorm",
-        activation: str = "SiLU",
-        transformer_type: str = "PostLN",
         temperature: float = 1.0,
     ) -> None:
         super(TransformerLayer, self).__init__()
         self.attention = AttentionBlock(d_model, n_heads, temperature)
-        self.transformer_type = transformer_type
         self.d_model = d_model
-        norm_class = getattr(nn, norm)
-        self.norm_attention = norm_class(d_model)
-        self.norm_mlp = norm_class(d_model)
-        self.mlp = FeedForward(d_model, dim_feedforward, activation)
+        self.norm_attention = torch.nn.LayerNorm(d_model)
+        self.norm_mlp = torch.nn.LayerNorm(d_model)
+        self.mlp = FeedForward(d_model)
         self.expanded_node_features = False
         if dim_node_features != d_model:
             self.expanded_node_features = True
             self.center_contraction = Linear(dim_node_features, d_model)
             self.center_expansion = Linear(d_model, dim_node_features)
-            self.norm_center_features = norm_class(dim_node_features)
-            self.center_mlp = FeedForward(
-                dim_node_features, 2 * dim_node_features, activation
-            )
+            self.norm_center_features = torch.nn.LayerNorm(dim_node_features)
+            self.center_mlp = FeedForward(dim_node_features)
         else:
             self.center_contraction = torch.nn.Identity()
             self.center_expansion = torch.nn.Identity()
@@ -213,27 +173,23 @@ class TransformerLayer(torch.nn.Module):
         self,
         node_embeddings: torch.Tensor,
         edge_embeddings: torch.Tensor,
-        cutoff_factors: torch.Tensor,
+        log_cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # print("before contraction", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
 
         if self.expanded_node_features:
             input_node_embeddings = self.center_contraction(node_embeddings)
         else:
             input_node_embeddings = node_embeddings
 
-        # print("before expanded", input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
-
         tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
         new_tokens = self.attention(
-            self.norm_attention(tokens), cutoff_factors, use_manual_attention
+            self.norm_attention(tokens), log_cutoff_factors, use_manual_attention
         )
         output_node_embeddings, output_edge_embeddings = torch.split(
             new_tokens, [1, new_tokens.shape[1] - 1], dim=1
         )
         if self.expanded_node_features:
-            # print("expanded node features", flush=True)
             output_node_embeddings = node_embeddings + self.center_expansion(
                 output_node_embeddings
             )
@@ -246,43 +202,13 @@ class TransformerLayer(torch.nn.Module):
             self.norm_mlp(output_edge_embeddings)
         )
 
-        # print("after expanded", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
-
-        return output_node_embeddings, output_edge_embeddings
-
-    def _forward_post_ln_impl(
-        self,
-        node_embeddings: torch.Tensor,
-        edge_embeddings: torch.Tensor,
-        cutoff_factors: torch.Tensor,
-        use_manual_attention: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.expanded_node_features:
-            input_node_embeddings = self.center_contraction(node_embeddings)
-        else:
-            input_node_embeddings = node_embeddings
-        tokens = torch.cat([input_node_embeddings, edge_embeddings], dim=1)
-        tokens = self.norm_attention(
-            tokens + self.attention(tokens, cutoff_factors, use_manual_attention)
-        )
-        tokens = self.norm_mlp(tokens + self.mlp(tokens))
-        output_node_embeddings, output_edge_embeddings = torch.split(
-            tokens, [1, tokens.shape[1] - 1], dim=1
-        )
-        if self.expanded_node_features:
-            output_node_embeddings = node_embeddings + self.center_expansion(
-                output_node_embeddings
-            )
-            output_node_embeddings = output_node_embeddings + self.center_mlp(
-                self.norm_center_features(output_node_embeddings)
-            )
         return output_node_embeddings, output_edge_embeddings
 
     def forward(
         self,
         node_embeddings: torch.Tensor,
         edge_embeddings: torch.Tensor,
-        cutoff_factors: torch.Tensor,
+        log_cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -292,7 +218,7 @@ class TransformerLayer(torch.nn.Module):
             (batch_size, d_model)
         :param edge_embeddings: The input edge embeddings, of shape
             (batch_size, seq_length, d_model)
-        :param cutoff_factors: The cutoff factors for the edges, of shape
+        :param log_cutoff_factors: The cutoff factors for the edges, of shape
             (batch_size, seq_length, seq_length)
         :param use_manual_attention: Whether to use the manual attention implementation
             (which supports double backward, needed for training with conservative
@@ -302,20 +228,12 @@ class TransformerLayer(torch.nn.Module):
             - The output node embeddings, of shape (batch_size, d_model)
             - The output edge embeddings, of shape (batch_size, seq_length, d_model)
         """
-        if self.transformer_type == "PostLN":
-            node_embeddings, edge_embeddings = self._forward_post_ln_impl(
-                node_embeddings,
-                edge_embeddings,
-                cutoff_factors,
-                use_manual_attention,
-            )
-        if self.transformer_type == "PreLN":
-            node_embeddings, edge_embeddings = self._forward_pre_ln_impl(
-                node_embeddings,
-                edge_embeddings,
-                cutoff_factors,
-                use_manual_attention,
-            )
+        node_embeddings, edge_embeddings = self._forward_pre_ln_impl(
+            node_embeddings,
+            edge_embeddings,
+            log_cutoff_factors,
+            use_manual_attention,
+        )
         return node_embeddings, edge_embeddings
 
 
@@ -342,31 +260,9 @@ class Transformer(torch.nn.Module):
         num_layers: int,
         n_heads: int,
         dim_node_features: int,
-        dim_feedforward: int = 512,
-        norm: str = "LayerNorm",
-        activation: str = "SiLU",
-        transformer_type: str = "PostLN",
         attention_temperature: float = 1.0,
     ) -> None:
         super(Transformer, self).__init__()
-        if norm not in AVAILABLE_NORMALIZATIONS:
-            raise ValueError(
-                f"Unknown normalization flag: {norm}. "
-                f"Please choose from: {AVAILABLE_NORMALIZATIONS}"
-            )
-
-        if transformer_type not in AVAILABLE_TRANSFORMER_TYPES:
-            raise ValueError(
-                f"Unknown transformer flag: {transformer_type}. "
-                f"Please choose from: {AVAILABLE_TRANSFORMER_TYPES}"
-            )
-        self.transformer_type = transformer_type
-
-        if activation not in AVAILABLE_ACTIVATIONS:
-            raise ValueError(
-                f"Unknown activation flag: {activation}. "
-                f"Please choose from: {AVAILABLE_ACTIVATIONS}"
-            )
 
         self.layers = nn.ModuleList(
             [
@@ -374,10 +270,6 @@ class Transformer(torch.nn.Module):
                     d_model=d_model,
                     n_heads=n_heads,
                     dim_node_features=dim_node_features,
-                    dim_feedforward=dim_feedforward,
-                    norm=norm,
-                    activation=activation,
-                    transformer_type=transformer_type,
                     temperature=attention_temperature,
                 )
                 for _ in range(num_layers)
@@ -388,7 +280,7 @@ class Transformer(torch.nn.Module):
         self,
         node_embeddings: torch.Tensor,
         edge_embeddings: torch.Tensor,
-        cutoff_factors: torch.Tensor,
+        log_cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -398,7 +290,7 @@ class Transformer(torch.nn.Module):
             (batch_size, d_model)
         :param edge_embeddings: The input edge embeddings, of shape
             (batch_size, seq_length, d_model)
-        :param cutoff_factors: The cutoff factors for the edges, of shape
+        :param log_cutoff_factors: The cutoff factors for the edges, of shape
             (batch_size, seq_length, seq_length)
         :param use_manual_attention: Whether to use the manual attention implementation
             (which supports double backward, needed for training with conservative
@@ -410,7 +302,7 @@ class Transformer(torch.nn.Module):
         """
         for layer in self.layers:
             node_embeddings, edge_embeddings = layer(
-                node_embeddings, edge_embeddings, cutoff_factors, use_manual_attention
+                node_embeddings, edge_embeddings, log_cutoff_factors, use_manual_attention
             )
         return node_embeddings, edge_embeddings
 
@@ -436,62 +328,26 @@ class CartesianTransformer(torch.nn.Module):
 
     def __init__(
         self,
-        cutoff: float,
-        cutoff_width: float,
         d_model: int,
         n_head: int,
         dim_node_features: int,
-        dim_feedforward: int,
         n_layers: int,
-        norm: str,
-        activation: str,
         attention_temperature: float,
-        transformer_type: str,
-        n_atomic_species: int,
-        is_first: bool,
     ) -> None:
         super(CartesianTransformer, self).__init__()
-        self.is_first = is_first
-        self.cutoff = cutoff
-        self.cutoff_width = cutoff_width
         self.trans = Transformer(
             d_model=d_model,
             num_layers=n_layers,
             n_heads=n_head,
             dim_node_features=dim_node_features,
-            dim_feedforward=dim_feedforward,
-            norm=norm,
-            activation=activation,
-            transformer_type=transformer_type,
             attention_temperature=attention_temperature,
         )
-
-        # self.edge_embedder = Linear(4, d_model)
-
-        # if not is_first:
-        #     n_merge = 3
-        # else:
-        #     n_merge = 2
-
-        # self.compress = nn.Sequential(
-        #     Linear(n_merge * d_model, d_model),
-        #     torch.nn.SiLU(),
-        #     Linear(d_model, d_model),
-        # )
-
-        # self.neighbor_embedder = DummyModule()  # for torchscript
-        # if not is_first:
-        #     self.neighbor_embedder = nn.Embedding(n_atomic_species, d_model)
 
     def forward(
         self,
         input_node_embeddings: torch.Tensor,
         input_messages: torch.Tensor,
-        element_indices_neighbors: torch.Tensor,
-        edge_vectors: torch.Tensor,
-        padding_mask: torch.Tensor,
-        edge_distances: torch.Tensor,
-        cutoff_factors: torch.Tensor,
+        log_cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -509,7 +365,7 @@ class CartesianTransformer(torch.nn.Module):
             which are padded, of shape (n_nodes, max_num_neighbors)
         :param edge_distances: The distances between the central atoms and their
             neighbors, of shape (n_nodes, max_num_neighbors)
-        :param cutoff_factors: The cutoff factors for the edges, of shape
+        :param log_cutoff_factors: The cutoff factors for the edges, of shape
             (n_nodes, max_num_neighbors)
         :param use_manual_attention: Whether to use the manual attention implementation
             (which supports double backward, needed for training with conservative
@@ -520,60 +376,22 @@ class CartesianTransformer(torch.nn.Module):
             - The output edge embeddings, of shape (n_nodes, max_num_neighbors, d_model)
         """
         node_embeddings = input_node_embeddings
-        # edge_embeddings = [edge_vectors, edge_distances[:, :, None]]
-
-        # on some systems, on isolated atoms, a torchscript bug concatenates the two
-        # (empty) float tensors into an int tensors, causing an error later on
-        # edge_embeddings = torch.cat(edge_embeddings, dim=2).to(edge_vectors.dtype)
-
-        # edge_embeddings = self.edge_embedder(edge_embeddings)
-
-        # if not self.is_first:
-        #     neighbor_elements_embeddings = self.neighbor_embedder(
-        #         element_indices_neighbors
-        #     )
-        #     edge_tokens = torch.cat(
-        #         [edge_embeddings, neighbor_elements_embeddings, input_messages], dim=2
-        #     )
-        # else:
-        #     neighbor_elements_embeddings = torch.empty(
-        #         0, device=edge_vectors.device, dtype=edge_vectors.dtype
-        #     )  # for torch script
-        #     edge_tokens = torch.cat([edge_embeddings, input_messages], dim=2)
 
         edge_tokens = input_messages
-        # tokens = torch.cat([node_elements_embedding[:, None, :], tokens], dim=1)
 
-        padding_mask_with_central_token = torch.ones(
-            padding_mask.shape[0], dtype=torch.bool, device=padding_mask.device
+        log_cutoff_centers = torch.zeros(
+            (log_cutoff_factors.shape[0], 1),
+            dtype=log_cutoff_factors.dtype,
+            device=log_cutoff_factors.device,
         )
-        total_padding_mask = torch.cat(
-            [padding_mask_with_central_token[:, None], padding_mask], dim=1
-        )
-
-        cutoff_subfactors = torch.ones(
-            padding_mask.shape[0],
-            dtype=cutoff_factors.dtype,
-            device=padding_mask.device,
-        )
-        cutoff_factors = torch.cat([cutoff_subfactors[:, None], cutoff_factors], dim=1)
-        cutoff_factors[~total_padding_mask] = 0.0
-
-        cutoff_factors = cutoff_factors[:, None, :]
-        cutoff_factors = cutoff_factors.repeat(1, cutoff_factors.shape[2], 1)
-
-        initial_num_tokens = edge_vectors.shape[1]
-
-        # print("before attention", node_embeddings.mean().item(), node_embeddings.std().item(), flush=True)
+        log_cutoff_factors = torch.cat([log_cutoff_centers, log_cutoff_factors], dim=1)
 
         output_node_embeddings, output_edge_embeddings = self.trans(
             node_embeddings[:, None, :],
             edge_tokens,
-            cutoff_factors=cutoff_factors,
+            log_cutoff_factors=log_cutoff_factors,
             use_manual_attention=use_manual_attention,
         )
-
-        # print("after attention", output_node_embeddings.mean().item(), output_node_embeddings.std().item(), flush=True)
 
         output_node_embeddings = output_node_embeddings.squeeze(1)
         return output_node_embeddings, output_edge_embeddings
@@ -629,36 +447,6 @@ def cutoff_func_cosine(
     f[mask_active] = 0.5 + 0.5 * torch.cos(torch.pi * scaled_values[mask_active])
     f[mask_smaller] = 1.0
     return f
-
-
-def cutoff_func_envelope(r, r_max: float, p: int = 6):
-    """
-    NequIP/MACE-style polynomial radial envelope.
-
-    Args:
-        r: distances (scalar, list, or torch.Tensor)
-        r_max: cutoff radius
-        p: polynomial cutoff parameter
-
-    Returns:
-        torch.Tensor with the same shape as r
-    """
-    if r_max <= 0:
-        raise ValueError("r_max must be positive.")
-    if int(p) != p or p < 1:
-        raise ValueError("p must be a positive integer.")
-
-    r = torch.as_tensor(r)
-    x = r / r_max
-
-    env = (
-        1.0
-        - 0.5 * (p + 1) * (p + 2) * x.pow(p)
-        + p * (p + 2) * x.pow(p + 1)
-        - 0.5 * p * (p + 1) * x.pow(p + 2)
-    )
-
-    return torch.where(r < r_max, env, torch.zeros_like(env))
 
 
 def get_nef_indices(
@@ -888,29 +676,6 @@ def compute_reversed_neighbor_list(
     return reversed_neighbor_list
 
 
-def _batch_index(data: AtomicData) -> torch.Tensor:
-    if "batch" in data:
-        return data["batch"].long()
-    return torch.zeros(
-        data["pos"].shape[0], device=data["pos"].device, dtype=torch.long
-    )
-
-
-def _num_graphs(data: AtomicData) -> int:
-    if "natoms" in data:
-        return int(data["natoms"].numel())
-    return 1
-
-
-def _sum_positions_by_graph(
-    pos: torch.Tensor, batch: torch.Tensor, num_graphs: int
-) -> torch.Tensor:
-    per_atom_position_sum = pos.sum(dim=-1, keepdim=True)
-    energy = pos.new_zeros((num_graphs, 1))
-    energy.index_add_(0, batch, per_atom_position_sum)
-    return energy.squeeze(-1)
-
-
 @registry.register_model("PET_backbone")
 class PETBackbone(nn.Module, BackboneInterface):
     """Dummy PET backbone used to wire PET into the MLIP stack.
@@ -930,6 +695,13 @@ class PETBackbone(nn.Module, BackboneInterface):
         dens_enabled: bool = False,
         max_num_elements: int = 1000,
         cutoff: float = 5.0,
+        d_pet: int = 512,
+        node_to_edge_ratio: int = 4,
+        num_gnn_layers: int = 8,
+        num_attention_layers: int = 2,
+        cutoff_width: float = 0.5,
+        num_heads: int = 8,
+        attention_temperature: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -942,16 +714,13 @@ class PETBackbone(nn.Module, BackboneInterface):
         self.cutoff = cutoff
         self.extra_config = kwargs
 
-        # hardcoded hypers
-        self.d_pet = 512
-        self.node_to_edge_ratio = 4
-        self.feedforward_ratio = 2
-        self.num_gnn_layers = 8
-        self.num_attention_layers = 2
-        self.cutoff_width = 0.5
-        self.num_heads = 8
-        self.cutoff_function = "cosine"
-        self.attention_temperature = 1.0
+        self.d_pet = d_pet
+        self.node_to_edge_ratio = node_to_edge_ratio
+        self.num_gnn_layers = num_gnn_layers
+        self.num_attention_layers = num_attention_layers
+        self.cutoff_width = cutoff_width
+        self.num_heads = num_heads
+        self.attention_temperature = attention_temperature
 
         self.node_embedder = nn.Embedding(self.max_num_elements, self.d_pet * self.node_to_edge_ratio)
         if self.dens_enabled:
@@ -975,14 +744,14 @@ class PETBackbone(nn.Module, BackboneInterface):
         )
 
         self.combination_norms = torch.nn.ModuleList(
-            [torch.nn.LayerNorm(2 * self.d_pet) for _ in range(self.num_gnn_layers)]
+            [torch.nn.RMSNorm(2 * self.d_pet) for _ in range(self.num_gnn_layers)]
         )
         self.combination_mlps = torch.nn.ModuleList(
             [
                 torch.nn.Sequential(
-                    Linear(2 * self.d_pet, self.feedforward_ratio * self.d_pet),
+                    Linear(2 * self.d_pet, 2 * self.d_pet),
                     torch.nn.SiLU(),
-                    Linear(self.feedforward_ratio * self.d_pet, self.d_pet),
+                    Linear(2 * self.d_pet, self.d_pet),
                 )
                 for _ in range(self.num_gnn_layers)
             ]
@@ -990,25 +759,15 @@ class PETBackbone(nn.Module, BackboneInterface):
         self.gnn_layers = torch.nn.ModuleList(
             [
                 CartesianTransformer(
-                    self.cutoff,
-                    self.cutoff_width,
                     self.d_pet,
                     self.num_heads,
                     self.node_to_edge_ratio * self.d_pet,
-                    self.feedforward_ratio * self.d_pet,
                     self.num_attention_layers,
-                    "RMSNorm",
-                    "SwiGLU",
                     self.attention_temperature,
-                    "PreLN",
-                    self.max_num_elements,
-                    layer_index == 0,  # is first layer
                 )
-                for layer_index in range(self.num_gnn_layers)
+                for _ in range(self.num_gnn_layers)
             ]
         )
-        self.edge_expander = Linear(self.d_pet, self.d_pet * self.node_to_edge_ratio)
-        self.edge_expander.linear_layer.weight.data.zero_()
 
 
     @classmethod
@@ -1089,13 +848,14 @@ class PETBackbone(nn.Module, BackboneInterface):
         max_edges_per_node = int(torch.max(num_neighbors))
 
         edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=-1))
-        if self.cutoff_function.lower() == "cosine":
-            cutoff_factors = cutoff_func_envelope(edge_distances, self.cutoff)
-        else:
-            raise ValueError(
-                f"Unknown cutoff function type: {self.cutoff_function}. "
-                f"Supported types are 'cosine'."
-            )
+
+        eps = 1e-4
+        x = edge_distances / (self.cutoff + eps)
+        log_cutoff_factors = torch.where(
+            x < 1.0 - eps,
+            -x/(1.0-x),
+            -10000.0,  # float16-friendly
+        )
 
         # Convert to NEF (Node-Edge-Feature) format:
         nef_indices, nef_mask = get_nef_indices(centers, num_atoms, max_edges_per_node)
@@ -1111,7 +871,7 @@ class PETBackbone(nn.Module, BackboneInterface):
         # TODO: turn into something more sane once you just do it at the beginning
         element_indices_centers = edge_array_to_nef(atomic_numbers_centers, nef_indices)
         element_indices_neighbors = edge_array_to_nef(atomic_numbers_neighbors, nef_indices)
-        cutoff_factors = edge_array_to_nef(cutoff_factors, nef_indices, nef_mask, 0.0)
+        log_cutoff_factors = edge_array_to_nef(log_cutoff_factors, nef_indices, nef_mask, -10000.0)
 
         corresponding_edges = get_corresponding_edges(
             torch.concatenate(
@@ -1169,10 +929,6 @@ class PETBackbone(nn.Module, BackboneInterface):
             self.edge_directional_embedder(cat)
         ], dim=-1)
         edge_features = self.edge_compressor(edge_features)
-        # edge_features = edge_features + self.edge_mlp(edge_features)
-        
-        # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
-        # print("before", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
 
         for combination_norm, combination_mlp, gnn_layer in zip(
             self.combination_norms, self.combination_mlps, self.gnn_layers, strict=True
@@ -1180,15 +936,9 @@ class PETBackbone(nn.Module, BackboneInterface):
             node_features, edge_features = gnn_layer(
                 node_features,
                 edge_features,
-                element_indices_neighbors,
-                edge_vectors,
-                nef_mask,
-                edge_distances,
-                cutoff_factors,
+                log_cutoff_factors,
                 use_manual_attention,
             )
-
-            # print("after gnn", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
 
             # The GNN contraction happens by reordering the messages,
             # using a reversed neighbor list, so the new input message
@@ -1207,26 +957,11 @@ class PETBackbone(nn.Module, BackboneInterface):
             )
             edge_features = edge_features + combination_mlp(combination_norm(concatenated))
 
-            # print(input_node_embeddings.mean().item(), input_node_embeddings.std().item(), flush=True)
-            # print("after combination", edge_features.mean().item(), (edge_features*cutoff_factors.unsqueeze(-1)).std().item(), flush=True)
-        
-        # print(flush=True)
-
-        edge_features = edge_features * cutoff_factors.unsqueeze(-1)
-        node_features = node_features + self.edge_expander(torch.sum(edge_features, dim=1))
-
-        # TODO: this is messed up, you could do this for the energy
-        structure_features = torch.index_add(
-            torch.zeros((len(data["cell"]), self.node_to_edge_ratio * self.d_pet), device=node_features.device),
-            0,
-            data["batch"],
-            node_features,
-        )
-        # divide by number of atoms
-        atoms_bincount = torch.bincount(data["batch"], minlength=len(data["cell"]))
-        structure_features = structure_features / atoms_bincount.unsqueeze(-1).clamp(min=1)
-
-        outputs = {"node_features": node_features, "structure_features": structure_features}
+        outputs = {
+            "node_features": node_features,
+            "edge_features": edge_features,
+            "cutoff_factors": torch.exp(log_cutoff_factors),
+        }
         if displacement is not None:
             outputs["displacement"] = displacement
         return outputs
@@ -1245,15 +980,24 @@ class PETEnergyHead(nn.Module, HeadInterface):
     # multi-layer perceptron on the node features
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
-            Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+        self.mlp_node = nn.Sequential(
+            Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
             nn.SiLU(),
-            Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 1),
+            Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 1),
         )
+        self.mlp_edge = nn.Sequential(
+            Linear(backbone.d_pet, 2 * backbone.d_pet),
+            nn.SiLU(),
+            Linear(2 * backbone.d_pet, 1),
+        )
+        # zero out the weights in the last layer of mlp_edge
+        self.mlp_edge[-1].linear_layer.weight.data.zero_()
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        atomic_energies = self.mlp(emb["node_features"]).squeeze(-1)
+        node_energies = self.mlp_node(emb["node_features"]).squeeze(-1)
+        edge_energies = self.mlp_edge(emb["edge_features"]).squeeze(-1)
+        atomic_energies = node_energies + torch.sum(edge_energies * emb["cutoff_factors"], dim=-1)
         total_energies = torch.index_add(
             torch.zeros((len(data["cell"]),), device=atomic_energies.device),
             0,
@@ -1268,21 +1012,37 @@ class PETDirectForceHead(nn.Module, HeadInterface):
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
         self.dens_enabled = backbone.dens_enabled
-        self.mlp = nn.Sequential(
-            Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+        self.mlp_node = nn.Sequential(
+            Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
             nn.SiLU(),
-            Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
+            Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 3),
         )
+        self.mlp_edge = nn.Sequential(
+            Linear(backbone.d_pet, 2 * backbone.d_pet),
+            nn.SiLU(),
+            Linear(2 * backbone.d_pet, 3),
+        )
+        # zero out the weights in the last layer of mlp_edge
+        self.mlp_edge[-1].linear_layer.weight.data.zero_()
         if self.dens_enabled:
-            self.dens_mlp = nn.Sequential(
-                Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+            self.dens_mlp_node = nn.Sequential(
+                Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
                 nn.SiLU(),
-                Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
+                Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 3),
             )
+            self.dens_mlp_edge = nn.Sequential(
+                Linear(backbone.d_pet, 2 * backbone.d_pet),
+                nn.SiLU(),
+                Linear(2 * backbone.d_pet, 3),
+            )
+            # zero out the weights in the last layer of dens_mlp_edge
+            self.dens_mlp_edge[-1].linear_layer.weight.data.zero_()
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        forces = self.mlp(emb["node_features"])
+        forces_nodes = self.mlp_node(emb["node_features"])
+        forces_edges = self.mlp_edge(emb["edge_features"])
+        forces = forces_nodes + torch.sum(forces_edges * emb["cutoff_factors"].unsqueeze(-1), dim=-2)
         if self.dens_enabled:
             noise_mask = (
                 data["noise_mask"]
@@ -1293,7 +1053,9 @@ class PETDirectForceHead(nn.Module, HeadInterface):
                     dtype=torch.bool,
                 )
             ).view(-1, 1)
-            dens_forces = self.dens_mlp(emb["node_features"])
+            dens_forces_nodes = self.dens_mlp_node(emb["node_features"])
+            dens_forces_edges = self.dens_mlp_edge(emb["edge_features"])
+            dens_forces = dens_forces_nodes + torch.sum(dens_forces_edges * emb["cutoff_factors"].unsqueeze(-1), dim=-2)
             forces = torch.where(noise_mask, dens_forces, forces)
         return {"forces": forces}
     
@@ -1304,15 +1066,28 @@ class PETDirectStressHead(nn.Module, HeadInterface):
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            Linear(backbone.node_to_edge_ratio * backbone.d_pet, backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet),
+            Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
             nn.SiLU(),
-            Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 9),
+            Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 9),
         )
+        self.edge_expander = Linear(backbone.d_pet, backbone.d_pet * backbone.node_to_edge_ratio)
+        self.edge_expander.linear_layer.weight.data.zero_()
 
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        stress = self.mlp(emb["structure_features"])
+        node_and_edge_features = emb["node_features"] + torch.sum(self.edge_expander(emb["edge_features"]) * emb["cutoff_factors"].unsqueeze(-1), dim=-2)
+        structure_features = torch.index_add(
+            torch.zeros((len(data["cell"]), node_and_edge_features.shape[1]), device=node_and_edge_features.device),
+            0,
+            data["batch"],
+            node_and_edge_features,
+        )
+        # divide by number of atoms
+        atoms_bincount = torch.bincount(data["batch"], minlength=len(data["cell"]))
+        structure_features = structure_features / atoms_bincount.unsqueeze(-1).clamp(min=1)
+
+        stress = self.mlp(structure_features)
         if "dens_batch_mask" in data:
             stress = torch.where(
                 data["dens_batch_mask"].view(-1, 1),
@@ -1330,22 +1105,14 @@ class PETGradientEnergyForceStressHead(PETEnergyHead):
         self.direct_forces = backbone.direct_forces
         self.regress_stress = backbone.regress_stress
         self.direct_stress = backbone.direct_stress
-        self.dens_enabled = backbone.dens_enabled
-        if self.dens_enabled:
-            self.dens_mlp = nn.Sequential(
-                Linear(
-                    backbone.node_to_edge_ratio * backbone.d_pet,
-                    backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet,
-                ),
-                nn.SiLU(),
-                Linear(backbone.feedforward_ratio * backbone.node_to_edge_ratio * backbone.d_pet, 3),
-            )
 
     @conditional_grad(torch.enable_grad())
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        atomic_energies = self.mlp(emb["node_features"]).squeeze(-1)
+        node_energies = self.mlp_node(emb["node_features"]).squeeze(-1)
+        edge_energies = self.mlp_edge(emb["edge_features"]).squeeze(-1)
+        atomic_energies = node_energies + torch.sum(edge_energies * emb["cutoff_factors"], dim=-1)
         energy = torch.index_add(
             torch.zeros((len(data["cell"]),), device=atomic_energies.device),
             0,
@@ -1379,19 +1146,6 @@ class PETGradientEnergyForceStressHead(PETEnergyHead):
                     create_graph=self.training,
                     retain_graph=True,
                 )[0]
-
-            if self.dens_enabled:
-                noise_mask = (
-                    data["noise_mask"]
-                    if "noise_mask" in data
-                    else torch.zeros(
-                        emb["node_features"].shape[0],
-                        device=emb["node_features"].device,
-                        dtype=torch.bool,
-                    )
-                ).view(-1, 1)
-                dens_forces = self.dens_mlp(emb["node_features"])
-                forces = torch.where(noise_mask, dens_forces, forces)
             outputs["forces"] = forces
 
         elif self.regress_stress and not self.direct_stress:
