@@ -992,14 +992,22 @@ class PETEnergyHead(nn.Module, HeadInterface):
         )
         # zero out the weights in the last layer of mlp_edge
         self.mlp_edge[-1].linear_layer.weight.data.zero_()
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.mlp_node[0].linear_layer.weight.dtype
+
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        node_energies = self.mlp_node(emb["node_features"]).squeeze(-1)
-        edge_energies = self.mlp_edge(emb["edge_features"]).squeeze(-1)
-        atomic_energies = node_energies + torch.sum(edge_energies * emb["cutoff_factors"], dim=-1)
+        node_features = emb["node_features"].to(self.dtype)
+        edge_features = emb["edge_features"].to(self.dtype)
+        cutoff_factors = emb["cutoff_factors"].to(self.dtype)
+        node_energies = self.mlp_node(node_features).squeeze(-1)
+        edge_energies = self.mlp_edge(edge_features).squeeze(-1)
+        atomic_energies = node_energies + torch.sum(edge_energies * cutoff_factors, dim=-1)
         total_energies = torch.index_add(
-            torch.zeros((len(data["cell"]),), device=atomic_energies.device),
+            torch.zeros((len(data["cell"]),), device=atomic_energies.device, dtype=atomic_energies.dtype),
             0,
             data["batch"],
             atomic_energies
@@ -1035,14 +1043,22 @@ class PETDirectForceHead(nn.Module, HeadInterface):
                 nn.SiLU(),
                 Linear(2 * backbone.d_pet, 3),
             )
-            # zero out the weights in the last layer of dens_mlp_edge
+        # zero out the weights in the last layer of dens_mlp_edge
             self.dens_mlp_edge[-1].linear_layer.weight.data.zero_()
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.mlp_node[0].linear_layer.weight.dtype
+
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        forces_nodes = self.mlp_node(emb["node_features"])
-        forces_edges = self.mlp_edge(emb["edge_features"])
-        forces = forces_nodes + torch.sum(forces_edges * emb["cutoff_factors"].unsqueeze(-1), dim=-2)
+        node_features = emb["node_features"].to(self.dtype)
+        edge_features = emb["edge_features"].to(self.dtype)
+        cutoff_factors = emb["cutoff_factors"].to(self.dtype)
+        forces_nodes = self.mlp_node(node_features)
+        forces_edges = self.mlp_edge(edge_features)
+        forces = forces_nodes + torch.sum(forces_edges * cutoff_factors.unsqueeze(-1), dim=-2)
         if self.dens_enabled:
             noise_mask = (
                 data["noise_mask"]
@@ -1053,9 +1069,9 @@ class PETDirectForceHead(nn.Module, HeadInterface):
                     dtype=torch.bool,
                 )
             ).view(-1, 1)
-            dens_forces_nodes = self.dens_mlp_node(emb["node_features"])
-            dens_forces_edges = self.dens_mlp_edge(emb["edge_features"])
-            dens_forces = dens_forces_nodes + torch.sum(dens_forces_edges * emb["cutoff_factors"].unsqueeze(-1), dim=-2)
+            dens_forces_nodes = self.dens_mlp_node(node_features)
+            dens_forces_edges = self.dens_mlp_edge(edge_features)
+            dens_forces = dens_forces_nodes + torch.sum(dens_forces_edges * cutoff_factors.unsqueeze(-1), dim=-2)
             forces = torch.where(noise_mask, dens_forces, forces)
         return {"forces": forces}
     
@@ -1073,12 +1089,19 @@ class PETDirectStressHead(nn.Module, HeadInterface):
         self.edge_expander = Linear(backbone.d_pet, backbone.d_pet * backbone.node_to_edge_ratio)
         self.edge_expander.linear_layer.weight.data.zero_()
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.mlp[0].linear_layer.weight.dtype
+
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        node_and_edge_features = emb["node_features"] + torch.sum(self.edge_expander(emb["edge_features"]) * emb["cutoff_factors"].unsqueeze(-1), dim=-2)
+        node_features = emb["node_features"].to(self.dtype)
+        edge_features = emb["edge_features"].to(self.dtype)
+        cutoff_factors = emb["cutoff_factors"].to(self.dtype)
+        node_and_edge_features = node_features + torch.sum(self.edge_expander(edge_features) * cutoff_factors.unsqueeze(-1), dim=-2)
         structure_features = torch.index_add(
-            torch.zeros((len(data["cell"]), node_and_edge_features.shape[1]), device=node_and_edge_features.device),
+            torch.zeros((len(data["cell"]), node_and_edge_features.shape[1]), device=node_and_edge_features.device, dtype=node_and_edge_features.dtype),
             0,
             data["batch"],
             node_and_edge_features,
@@ -1110,11 +1133,14 @@ class PETGradientEnergyForceStressHead(PETEnergyHead):
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        node_energies = self.mlp_node(emb["node_features"]).squeeze(-1)
-        edge_energies = self.mlp_edge(emb["edge_features"]).squeeze(-1)
-        atomic_energies = node_energies + torch.sum(edge_energies * emb["cutoff_factors"], dim=-1)
+        node_features = emb["node_features"].to(self.dtype)
+        edge_features = emb["edge_features"].to(self.dtype)
+        cutoff_factors = emb["cutoff_factors"].to(self.dtype)
+        node_energies = self.mlp_node(node_features).squeeze(-1)
+        edge_energies = self.mlp_edge(edge_features).squeeze(-1)
+        atomic_energies = node_energies + torch.sum(edge_energies * cutoff_factors, dim=-1)
         energy = torch.index_add(
-            torch.zeros((len(data["cell"]),), device=atomic_energies.device),
+            torch.zeros((len(data["cell"]),), device=atomic_energies.device, dtype=atomic_energies.dtype),
             0,
             data["batch"],
             atomic_energies,
