@@ -297,8 +297,13 @@ def slurm_launch(cfg: DictConfig, log_dir: str) -> list:
         )
         jobs = [job]
     elif scheduler_cfg.num_array_jobs > 1:
+        array_parallelism = (
+            scheduler_cfg.array_parallelism
+            if scheduler_cfg.array_parallelism is not None
+            else scheduler_cfg.num_array_jobs
+        )
         executor.update_parameters(
-            slurm_array_parallelism=scheduler_cfg.num_array_jobs,
+            slurm_array_parallelism=array_parallelism,
         )
 
         jobs = []
