@@ -10,9 +10,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import nn
 
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
@@ -24,6 +21,24 @@ if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
     from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
     from fairchem.core.units.mlip_unit.mlip_unit import Task
+
+# vdw radii from Z=1 to Z=103 in Ang, obtained from the mendeleev library
+VDW_RADII = [
+    1.1, 1.4, 1.82, 1.53, 1.92, 1.7, 1.55, 1.52, 1.47, 1.54, 2.27, 1.73, 1.84, 2.1, 1.8,
+    1.8, 1.75, 1.88, 2.75, 2.31, 2.15, 2.11, 2.07, 2.06, 2.05, 2.04, 2.0, 1.97, 1.96,
+    2.01, 1.87, 2.11, 1.85, 1.9, 1.85, 2.02, 3.03, 2.49, 2.32, 2.23, 2.18, 2.17, 2.16,
+    2.13, 2.1, 2.1, 2.11, 2.18, 1.93, 2.17, 2.06, 2.06, 1.98, 2.16, 3.43, 2.68, 2.43,
+    2.42, 2.4, 2.39, 2.38, 2.36, 2.35, 2.34, 2.33, 2.31, 2.3, 2.29, 2.27, 2.26, 2.24,
+    2.23, 2.22, 2.18, 2.16, 2.16, 2.13, 2.13, 2.14, 2.23, 1.96, 2.02, 2.07, 1.97, 2.02,
+    2.2, 3.48, 2.83, 2.47, 2.45, 2.43, 2.41, 2.39, 2.43, 2.44, 2.45, 2.44, 2.45, 2.45,
+    2.45, 2.46, 2.46, 2.46
+]
+
+def get_vdw_radii(max_num_elements: int) -> torch.Tensor:
+    vdw_radii = [2.0] * max_num_elements
+    for z in range(1, min(max_num_elements, len(VDW_RADII) + 1)):
+        vdw_radii[z] = VDW_RADII[z - 1]
+    return torch.tensor(vdw_radii, dtype=torch.get_default_dtype())
 
 
 class Linear(torch.nn.Module):
@@ -39,7 +54,7 @@ class Linear(torch.nn.Module):
         return self.linear_layer(x)
 
 
-class FeedForward(nn.Module):
+class FeedForward(torch.nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         dim_feedforward = 2 * d_model
@@ -58,7 +73,7 @@ class FeedForward(nn.Module):
         return x
 
 
-class AttentionBlock(nn.Module):
+class AttentionBlock(torch.nn.Module):
     """
     Multi-head attention block.
 
@@ -264,7 +279,7 @@ class Transformer(torch.nn.Module):
     ) -> None:
         super(Transformer, self).__init__()
 
-        self.layers = nn.ModuleList(
+        self.layers = torch.nn.ModuleList(
             [
                 TransformerLayer(
                     d_model=d_model,
@@ -312,7 +327,6 @@ class CartesianTransformer(torch.nn.Module):
     Cartesian Transformer implementation for handling 3D coordinates.
 
     :param cutoff: The cutoff distance for neighbor interactions.
-    :param cutoff_width: The width of the cutoff function.
     :param d_model: The dimension of the model.
     :param n_head: The number of attention heads.
     :param dim_node_features: The dimension of the node features.
@@ -677,7 +691,7 @@ def compute_reversed_neighbor_list(
 
 
 @registry.register_model("PET_backbone")
-class PETBackbone(nn.Module, BackboneInterface):
+class PETBackbone(torch.nn.Module, BackboneInterface):
     """Dummy PET backbone used to wire PET into the MLIP stack.
 
     This is intentionally minimal while PET is being integrated. It preserves the
@@ -694,44 +708,47 @@ class PETBackbone(nn.Module, BackboneInterface):
         direct_stress: bool = True,
         dens_enabled: bool = False,
         max_num_elements: int = 1000,
-        cutoff: float = 5.0,
+        cutoff_factor: float = 3.0,
         d_pet: int = 512,
         node_to_edge_ratio: int = 4,
         num_gnn_layers: int = 8,
         num_attention_layers: int = 2,
-        cutoff_width: float = 0.5,
         num_heads: int = 8,
         attention_temperature: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__()
+        if "cutoff" in kwargs:
+            raise ValueError("`cutoff` isn't supported anymore in PET!")
+
         self.regress_forces = regress_forces
         self.direct_forces = direct_forces
         self.regress_stress = regress_stress
         self.direct_stress = direct_stress
         self.dens_enabled = dens_enabled
         self.max_num_elements = max_num_elements
-        self.cutoff = cutoff
+        self.cutoff_factor = cutoff_factor
         self.extra_config = kwargs
 
         self.d_pet = d_pet
         self.node_to_edge_ratio = node_to_edge_ratio
         self.num_gnn_layers = num_gnn_layers
         self.num_attention_layers = num_attention_layers
-        self.cutoff_width = cutoff_width
         self.num_heads = num_heads
         self.attention_temperature = attention_temperature
 
-        self.node_embedder = nn.Embedding(self.max_num_elements, self.d_pet * self.node_to_edge_ratio)
+        self.register_buffer("per_atom_cutoffs", self.cutoff_factor * get_vdw_radii(max_num_elements))
+
+        self.node_embedder = torch.nn.Embedding(self.max_num_elements, self.d_pet * self.node_to_edge_ratio)
         if self.dens_enabled:
             self.dens_force_encoder = torch.nn.Sequential(
                 Linear(4, self.node_to_edge_ratio * self.d_pet),
                 torch.nn.SiLU(),
                 Linear(self.node_to_edge_ratio * self.d_pet, self.node_to_edge_ratio * self.d_pet),
             )
-        self.edge_center_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
-        self.edge_neighbor_embedder = nn.Embedding(self.max_num_elements, self.d_pet)
-        self.edge_directional_embedder = Linear(4, self.d_pet)
+        self.edge_center_embedder = torch.nn.Embedding(self.max_num_elements, self.d_pet)
+        self.edge_neighbor_embedder = torch.nn.Embedding(self.max_num_elements, self.d_pet)
+        self.edge_directional_embedder = torch.nn.Linear(4, self.d_pet)
         self.edge_compressor = torch.nn.Sequential(
             Linear(3 * self.d_pet, self.d_pet),
             torch.nn.SiLU(),
@@ -844,18 +861,31 @@ class PETBackbone(nn.Module, BackboneInterface):
 
         num_atoms = len(positions)
 
+        edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=-1))
+        pair_cutoffs = (self.per_atom_cutoffs[atomic_numbers[centers]] + self.per_atom_cutoffs[atomic_numbers[neighbors]]) / 2.0
+
+        keep = torch.nonzero(edge_distances <= pair_cutoffs).squeeze(-1)
+        pair_cutoffs = pair_cutoffs.index_select(0, keep)
+        centers = centers.index_select(0, keep)
+        neighbors = neighbors.index_select(0, keep)
+        edge_vectors = edge_vectors.index_select(0, keep)
+        edge_distances = edge_distances.index_select(0, keep)
+        cell_offsets = cell_offsets.index_select(0, keep)
+
         num_neighbors = torch.bincount(centers, minlength=num_atoms)
         max_edges_per_node = int(torch.max(num_neighbors))
 
-        edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=-1))
-
         eps = 1e-4
-        x = edge_distances / (self.cutoff + eps)
+        x = edge_distances / (pair_cutoffs + eps)
         log_cutoff_factors = torch.where(
             x < 1.0 - eps,
             -x/(1.0-x),
             -10000.0,  # float16-friendly
         )
+
+        # normalize edge vectors and distances for the NN
+        edge_vectors = edge_vectors / (0.5 * pair_cutoffs.unsqueeze(-1) + eps)
+        edge_distances = edge_distances / (0.5 * pair_cutoffs + eps)
 
         # Convert to NEF (Node-Edge-Feature) format:
         nef_indices, nef_mask = get_nef_indices(centers, num_atoms, max_edges_per_node)
@@ -922,7 +952,7 @@ class PETBackbone(nn.Module, BackboneInterface):
                 node_features.dtype
             )
 
-        cat = torch.cat([edge_vectors, edge_distances.unsqueeze(-1)], dim=-1) / (0.5 *self.cutoff)  # very rough normalization attempt
+        cat = torch.cat([edge_vectors, edge_distances.unsqueeze(-1)], dim=-1)
         edge_features = torch.concatenate([
             self.edge_center_embedder(element_indices_centers),
             self.edge_neighbor_embedder(element_indices_neighbors),
@@ -976,18 +1006,18 @@ class PETBackbone(nn.Module, BackboneInterface):
 
 
 @registry.register_model("PET_energy_head")
-class PETEnergyHead(nn.Module, HeadInterface):
+class PETEnergyHead(torch.nn.Module, HeadInterface):
     # multi-layer perceptron on the node features
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
-        self.mlp_node = nn.Sequential(
+        self.mlp_node = torch.nn.Sequential(
             Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
-            nn.SiLU(),
+            torch.nn.SiLU(),
             Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 1),
         )
-        self.mlp_edge = nn.Sequential(
+        self.mlp_edge = torch.nn.Sequential(
             Linear(backbone.d_pet, 2 * backbone.d_pet),
-            nn.SiLU(),
+            torch.nn.SiLU(),
             Linear(2 * backbone.d_pet, 1),
         )
         # zero out the weights in the last layer of mlp_edge
@@ -1015,32 +1045,32 @@ class PETEnergyHead(nn.Module, HeadInterface):
         return {"energy": total_energies}
 
 @registry.register_model("PET_direct_force_head")
-class PETDirectForceHead(nn.Module, HeadInterface):
+class PETDirectForceHead(torch.nn.Module, HeadInterface):
     # multi-layer perceptron on the node features
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
         self.dens_enabled = backbone.dens_enabled
-        self.mlp_node = nn.Sequential(
+        self.mlp_node = torch.nn.Sequential(
             Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
-            nn.SiLU(),
+            torch.nn.SiLU(),
             Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 3),
         )
-        self.mlp_edge = nn.Sequential(
+        self.mlp_edge = torch.nn.Sequential(
             Linear(backbone.d_pet, 2 * backbone.d_pet),
-            nn.SiLU(),
+            torch.nn.SiLU(),
             Linear(2 * backbone.d_pet, 3),
         )
         # zero out the weights in the last layer of mlp_edge
         self.mlp_edge[-1].linear_layer.weight.data.zero_()
         if self.dens_enabled:
-            self.dens_mlp_node = nn.Sequential(
+            self.dens_mlp_node = torch.nn.Sequential(
                 Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
-                nn.SiLU(),
+                torch.nn.SiLU(),
                 Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 3),
             )
-            self.dens_mlp_edge = nn.Sequential(
+            self.dens_mlp_edge = torch.nn.Sequential(
                 Linear(backbone.d_pet, 2 * backbone.d_pet),
-                nn.SiLU(),
+                torch.nn.SiLU(),
                 Linear(2 * backbone.d_pet, 3),
             )
         # zero out the weights in the last layer of dens_mlp_edge
@@ -1077,13 +1107,13 @@ class PETDirectForceHead(nn.Module, HeadInterface):
     
 
 @registry.register_model("PET_direct_stress_head")
-class PETDirectStressHead(nn.Module, HeadInterface):
+class PETDirectStressHead(torch.nn.Module, HeadInterface):
     # multi-layer perceptron on the structure features
     def __init__(self, backbone: PETBackbone) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
+        self.mlp = torch.nn.Sequential(
             Linear(backbone.d_pet * backbone.node_to_edge_ratio, 2 * backbone.d_pet * backbone.node_to_edge_ratio),
-            nn.SiLU(),
+            torch.nn.SiLU(),
             Linear(2 * backbone.d_pet * backbone.node_to_edge_ratio, 9),
         )
         self.edge_expander = Linear(backbone.d_pet, backbone.d_pet * backbone.node_to_edge_ratio)
