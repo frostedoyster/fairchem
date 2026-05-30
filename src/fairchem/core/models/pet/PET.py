@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -21,25 +22,6 @@ if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
     from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
     from fairchem.core.units.mlip_unit.mlip_unit import Task
-
-# vdw radii from Z=1 to Z=103 in Ang, obtained from the mendeleev library
-VDW_RADII = [
-    1.1, 1.4, 1.82, 1.53, 1.92, 1.7, 1.55, 1.52, 1.47, 1.54, 2.27, 1.73, 1.84, 2.1, 1.8,
-    1.8, 1.75, 1.88, 2.75, 2.31, 2.15, 2.11, 2.07, 2.06, 2.05, 2.04, 2.0, 1.97, 1.96,
-    2.01, 1.87, 2.11, 1.85, 1.9, 1.85, 2.02, 3.03, 2.49, 2.32, 2.23, 2.18, 2.17, 2.16,
-    2.13, 2.1, 2.1, 2.11, 2.18, 1.93, 2.17, 2.06, 2.06, 1.98, 2.16, 3.43, 2.68, 2.43,
-    2.42, 2.4, 2.39, 2.38, 2.36, 2.35, 2.34, 2.33, 2.31, 2.3, 2.29, 2.27, 2.26, 2.24,
-    2.23, 2.22, 2.18, 2.16, 2.16, 2.13, 2.13, 2.14, 2.23, 1.96, 2.02, 2.07, 1.97, 2.02,
-    2.2, 3.48, 2.83, 2.47, 2.45, 2.43, 2.41, 2.39, 2.43, 2.44, 2.45, 2.44, 2.45, 2.45,
-    2.45, 2.46, 2.46, 2.46
-]
-
-def get_vdw_radii(max_num_elements: int) -> torch.Tensor:
-    vdw_radii = [2.0] * max_num_elements
-    for z in range(1, min(max_num_elements, len(VDW_RADII) + 1)):
-        vdw_radii[z] = VDW_RADII[z - 1]
-    return torch.tensor(vdw_radii, dtype=torch.get_default_dtype())
-
 
 class Linear(torch.nn.Module):
 
@@ -439,11 +421,11 @@ def manual_attention(
 
 
 
-def cutoff_func_cosine(
+def cutoff_func_bump(
     values: torch.Tensor, cutoff: torch.Tensor, width: float
 ) -> torch.Tensor:
     """
-    Cosine cutoff function.
+    Bump cutoff function.
 
     :param values: Distances at which to evaluate the cutoff function.
     :param cutoff: Cutoff radius for each node.
@@ -452,15 +434,172 @@ def cutoff_func_cosine(
     """
 
     scaled_values = (values - (cutoff - width)) / width
+    clamped = scaled_values.clamp(1e-6, 1.0 - 1e-6)
+    return 0.5 * (1 + torch.tanh(1 / torch.tan(torch.pi * clamped)))
 
-    mask_smaller = scaled_values <= 0.0
-    mask_active = (scaled_values > 0.0) & (scaled_values < 1.0)
 
-    f = torch.zeros_like(scaled_values)
+def log_cutoff_func_bump(
+    values: torch.Tensor,
+    cutoff: torch.Tensor,
+    width: float,
+    min_log: float = -10000.0,
+) -> torch.Tensor:
+    """
+    Numerically stable log of the bump cutoff function.
 
-    f[mask_active] = 0.5 + 0.5 * torch.cos(torch.pi * scaled_values[mask_active])
-    f[mask_smaller] = 1.0
-    return f
+    Uses 0.5 * (1 + tanh(u)) == sigmoid(2u), so
+    log(bump) = logsigmoid(2 * cot(pi * scaled_distance)).
+    """
+
+    scaled_values = (values - (cutoff - width)) / width
+    safe = scaled_values.clamp(1e-6, 1.0 - 1e-6)
+
+    # Keep the trigonometry in at least fp32. fp16 cotangent near the bump
+    # boundaries can overflow before logsigmoid has a chance to stabilize it.
+    calc_dtype = (
+        torch.float32
+        if safe.dtype in (torch.float16, torch.bfloat16)
+        else safe.dtype
+    )
+    safe_calc = safe.to(calc_dtype)
+    log_active = torch.nn.functional.logsigmoid(
+        2.0 / torch.tan(torch.pi * safe_calc)
+    ).clamp_min(min_log)
+    log_active = log_active.to(scaled_values.dtype)
+
+    zeros = torch.zeros_like(scaled_values)
+    floor = torch.full_like(scaled_values, min_log)
+    return torch.where(
+        scaled_values <= 0.0,
+        zeros,
+        torch.where(scaled_values >= 1.0, floor, log_active),
+    )
+
+
+def _n_total(
+    r_per_atom: torch.Tensor,
+    edge_distances: torch.Tensor,
+    centers: torch.Tensor,
+    num_nodes: int,
+    cutoff_width: float,
+    inv_max_cutoff: float,
+    num_neighbors_adaptive: float,
+) -> torch.Tensor:
+    per_edge = cutoff_func_bump(edge_distances, r_per_atom[centers], cutoff_width)
+    n = torch.zeros(num_nodes, dtype=edge_distances.dtype, device=edge_distances.device)
+    n.index_add_(0, centers, per_edge)
+    x = r_per_atom * inv_max_cutoff
+    return n + num_neighbors_adaptive * x.pow(3)
+
+
+def _n_total_and_dn_dr(
+    r_per_atom: torch.Tensor,
+    edge_distances: torch.Tensor,
+    centers: torch.Tensor,
+    num_nodes: int,
+    cutoff_width: float,
+    inv_max_cutoff: float,
+    num_neighbors_adaptive: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r_per_edge = r_per_atom[centers]
+    scaled = (edge_distances - (r_per_edge - cutoff_width)) / cutoff_width
+    active = (scaled > 0.0) & (scaled < 1.0)
+    smaller = scaled <= 0.0
+
+    safe = scaled.clamp(1e-6, 1.0 - 1e-6)
+    s = math.pi * safe
+    sin_s = torch.sin(s)
+    cot_s = torch.cos(s) / sin_s
+    tanh_cot = torch.tanh(cot_s)
+
+    f_active = 0.5 * (1.0 + tanh_cot)
+    f = torch.where(active, f_active, smaller.to(scaled.dtype))
+
+    sech_sq = 1.0 - tanh_cot * tanh_cot
+    df_dr = ((0.5 * math.pi / cutoff_width) * sech_sq / (sin_s * sin_s)) * active.to(
+        scaled.dtype
+    )
+
+    n = torch.zeros(num_nodes, dtype=edge_distances.dtype, device=edge_distances.device)
+    n.index_add_(0, centers, f)
+    dn = torch.zeros(num_nodes, dtype=edge_distances.dtype, device=edge_distances.device)
+    dn.index_add_(0, centers, df_dr)
+
+    x = r_per_atom * inv_max_cutoff
+    n = n + num_neighbors_adaptive * x.pow(3)
+    dn = dn + 3.0 * num_neighbors_adaptive * x.pow(2) * inv_max_cutoff
+
+    return n, dn
+
+
+def get_adaptive_cutoffs_solver(
+    centers: torch.Tensor,
+    edge_distances: torch.Tensor,
+    num_neighbors_adaptive: float,
+    num_nodes: int,
+    max_cutoff: float,
+    cutoff_width: float,
+) -> torch.Tensor:
+    edge_distances_d = edge_distances.detach()
+    inv_max_cutoff = 1.0 / max_cutoff
+
+    with torch.profiler.record_function("PET::adaptive_cutoff_newton"):
+        r_lo = torch.zeros(
+            num_nodes,
+            dtype=edge_distances.dtype,
+            device=edge_distances.device,
+        )
+        r_hi = torch.full(
+            (num_nodes,),
+            max_cutoff,
+            dtype=edge_distances.dtype,
+            device=edge_distances.device,
+        )
+        r = 0.5 * r_hi
+        for _ in range(10):
+            n, dn = _n_total_and_dn_dr(
+                r,
+                edge_distances_d,
+                centers,
+                num_nodes,
+                cutoff_width,
+                inv_max_cutoff,
+                num_neighbors_adaptive,
+            )
+            f = n - num_neighbors_adaptive
+            below = f <= 0
+            r_lo = torch.where(below, r, r_lo)
+            r_hi = torch.where(below, r_hi, r)
+            r_newton = r - f / dn.clamp_min(1e-6)
+            inside = (r_newton >= r_lo) & (r_newton <= r_hi)
+            r = torch.where(inside, r_newton, 0.5 * (r_lo + r_hi))
+        _, dn_root = _n_total_and_dn_dr(
+            r,
+            edge_distances_d,
+            centers,
+            num_nodes,
+            cutoff_width,
+            inv_max_cutoff,
+            num_neighbors_adaptive,
+        )
+
+    with torch.profiler.record_function("PET::adaptive_cutoff_ift"):
+        n_residual = (
+            _n_total(
+                r,
+                edge_distances,
+                centers,
+                num_nodes,
+                cutoff_width,
+                inv_max_cutoff,
+                num_neighbors_adaptive,
+            )
+            - num_neighbors_adaptive
+        )
+        min_cutoff_factor: float = 1.0 / 16.0
+        return (r - n_residual / dn_root.clamp_min(1e-6)).clamp(
+            max_cutoff * min_cutoff_factor, max_cutoff
+        )
 
 
 def get_nef_indices(
@@ -708,7 +847,9 @@ class PETBackbone(torch.nn.Module, BackboneInterface):
         direct_stress: bool = True,
         dens_enabled: bool = False,
         max_num_elements: int = 1000,
-        cutoff_factor: float = 3.0,
+        cutoff: float = 6.0,
+        cutoff_width: float = 0.5,
+        num_neighbors_adaptive: Optional[float] = None,
         d_pet: int = 512,
         node_to_edge_ratio: int = 4,
         num_gnn_layers: int = 8,
@@ -718,8 +859,11 @@ class PETBackbone(torch.nn.Module, BackboneInterface):
         **kwargs,
     ) -> None:
         super().__init__()
-        if "cutoff" in kwargs:
-            raise ValueError("`cutoff` isn't supported anymore in PET!")
+        if "cutoff_factor" in kwargs:
+            raise ValueError(
+                "`cutoff_factor` has been removed; use `cutoff` and "
+                "`num_neighbors_adaptive` instead."
+            )
 
         self.regress_forces = regress_forces
         self.direct_forces = direct_forces
@@ -727,7 +871,9 @@ class PETBackbone(torch.nn.Module, BackboneInterface):
         self.direct_stress = direct_stress
         self.dens_enabled = dens_enabled
         self.max_num_elements = max_num_elements
-        self.cutoff_factor = cutoff_factor
+        self.cutoff = cutoff
+        self.cutoff_width = cutoff_width
+        self.num_neighbors_adaptive = num_neighbors_adaptive
         self.extra_config = kwargs
 
         self.d_pet = d_pet
@@ -736,8 +882,6 @@ class PETBackbone(torch.nn.Module, BackboneInterface):
         self.num_attention_layers = num_attention_layers
         self.num_heads = num_heads
         self.attention_temperature = attention_temperature
-
-        self.register_buffer("per_atom_cutoffs", self.cutoff_factor * get_vdw_radii(max_num_elements))
 
         self.node_embedder = torch.nn.Embedding(self.max_num_elements, self.d_pet * self.node_to_edge_ratio)
         if self.dens_enabled:
@@ -861,8 +1005,24 @@ class PETBackbone(torch.nn.Module, BackboneInterface):
 
         num_atoms = len(positions)
 
-        edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=-1))
-        pair_cutoffs = (self.per_atom_cutoffs[atomic_numbers[centers]] + self.per_atom_cutoffs[atomic_numbers[neighbors]]) / 2.0
+        edge_distances = torch.linalg.vector_norm(edge_vectors, dim=-1) + 1e-15
+        if self.num_neighbors_adaptive is not None:
+            with torch.profiler.record_function("PET::get_adaptive_cutoffs"):
+                atomic_cutoffs = get_adaptive_cutoffs_solver(
+                    centers,
+                    edge_distances,
+                    self.num_neighbors_adaptive,
+                    num_atoms,
+                    self.cutoff,
+                    cutoff_width=self.cutoff_width,
+                )
+                pair_cutoffs = (atomic_cutoffs[centers] + atomic_cutoffs[neighbors]) / 2.0
+        else:
+            pair_cutoffs = self.cutoff * torch.ones(
+                len(centers),
+                device=positions.device,
+                dtype=positions.dtype,
+            )
 
         keep = torch.nonzero(edge_distances <= pair_cutoffs).squeeze(-1)
         pair_cutoffs = pair_cutoffs.index_select(0, keep)
@@ -875,17 +1035,11 @@ class PETBackbone(torch.nn.Module, BackboneInterface):
         num_neighbors = torch.bincount(centers, minlength=num_atoms)
         max_edges_per_node = int(torch.max(num_neighbors))
 
-        eps = 1e-4
-        x = edge_distances / (pair_cutoffs + eps)
-        log_cutoff_factors = torch.where(
-            x < 1.0 - eps,
-            -x/(1.0-x),
-            -10000.0,  # float16-friendly
+        log_cutoff_factors = log_cutoff_func_bump(
+            edge_distances,
+            pair_cutoffs,
+            self.cutoff_width,
         )
-
-        # normalize edge vectors and distances for the NN
-        edge_vectors = edge_vectors / (0.5 * pair_cutoffs.unsqueeze(-1) + eps)
-        edge_distances = edge_distances / (0.5 * pair_cutoffs + eps)
 
         # Convert to NEF (Node-Edge-Feature) format:
         nef_indices, nef_mask = get_nef_indices(centers, num_atoms, max_edges_per_node)

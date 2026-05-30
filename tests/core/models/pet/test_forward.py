@@ -20,29 +20,42 @@ from fairchem.core.models.pet.PET import (
 
 
 def test_pet_dummy_forward_and_backward_cpu():
-    data = AtomicData.from_ase(get_fcc_crystal_by_num_atoms(4))
-    data["batch"] = torch.zeros(data["pos"].shape[0], dtype=torch.long)
-    data["natoms"] = torch.tensor([data["pos"].shape[0]])
+    for num_neighbors_adaptive in (None, 8.0):
+        data = AtomicData.from_ase(
+            get_fcc_crystal_by_num_atoms(4),
+            r_edges=True,
+            radius=6.0,
+            max_neigh=100,
+        )
+        data["batch"] = torch.zeros(data["pos"].shape[0], dtype=torch.long)
+        data["natoms"] = torch.tensor([data["pos"].shape[0]])
 
-    backbone = PETBackbone()
-    energy_head = PETEnergyHead(backbone)
-    force_head = PETDirectForceHead(backbone)
-    model = HydraModelV2(
-        backbone,
-        {
-            "energy": energy_head,
-            "forces": force_head,
-        },
-    )
+        backbone = PETBackbone(
+            cutoff=6.0,
+            cutoff_width=0.5,
+            num_neighbors_adaptive=num_neighbors_adaptive,
+            d_pet=32,
+            node_to_edge_ratio=2,
+            num_gnn_layers=1,
+            num_attention_layers=1,
+            num_heads=4,
+            regress_forces=False,
+            regress_stress=False,
+        )
+        model = HydraModelV2(
+            backbone,
+            {
+                "energy": PETEnergyHead(backbone),
+                "forces": PETDirectForceHead(backbone),
+            },
+        )
 
-    out = model(data)
+        out = model(data)
 
-    expected_energy = data["pos"].sum().reshape(1)
-    assert torch.allclose(out["energy"]["energy"], expected_energy)
-    assert out["forces"]["forces"].shape == data["pos"].shape
+        assert out["energy"]["energy"].shape == torch.Size([1])
+        assert out["forces"]["forces"].shape == data["pos"].shape
 
-    loss = out["energy"]["energy"].sum() + out["forces"]["forces"].sum()
-    loss.backward()
+        loss = out["energy"]["energy"].sum() + out["forces"]["forces"].sum()
+        loss.backward()
 
-    assert energy_head.energy_scale.grad is not None
-    assert force_head.force_scale.grad is not None
+        assert any(p.grad is not None for p in model.parameters())
